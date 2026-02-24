@@ -1,0 +1,9 @@
+{
+  "_comment": "Example disease_map.json. Replace with your actual file. Flag order: [HLHS, ASD, VSD, AVSD, DORV, PuA, ToF, TGA]",
+  "ct_1001_image": [0, 0, 0, 0, 0, 0, 0, 0],
+  "ct_1002_image": [1, 0, 0, 0, 0, 0, 0, 0],
+  "ct_1003_image": [0, 0, 1, 0, 0, 0, 0, 0],
+  "ct_1004_image": [0, 0, 0, 0, 0, 1, 0, 0],
+  "ct_1005_image": [0, 0, 0, 0, 0, 0, 1, 0],
+  "ct_1006_image": [0, 0, 0, 0, 0, 0, 0, 1]
+}

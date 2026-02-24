@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nnunet-chd-postprocessing"
+version = "0.1.0"
+description = "Anatomy-informed post-processing for nnU-Net CHD segmentation (AO/PA label correction)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "nibabel>=4.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=1.5",
+    "matplotlib>=3.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+chd-postprocess = "scripts.run_postprocessing:main"
+chd-evaluate    = "scripts.evaluate_before_after:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["chd_postprocessing*"]
