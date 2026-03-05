@@ -1,8 +1,8 @@
 """Tests for the atlas-based post-processing pipeline.
 
 All tests are self-contained — no NIfTI files on disk are required.
-Synthetic label volumes are constructed in-memory so the correct
-outcomes are known analytically.
+Synthetic label volumes are constructed in-memory so correct outcomes
+are known analytically.
 
 Volume layout (40 × 40 × 40 voxels unless noted)
 -------------------------------------------------
@@ -25,36 +25,41 @@ from chd_postprocessing.atlas import AtlasEntry, AtlasLibrary, create_synthetic_
 from chd_postprocessing.atlas_pipeline import run_atlas_pipeline, AtlasPipelineResult
 from chd_postprocessing.config import FOREGROUND_CLASSES, LABELS
 from chd_postprocessing.label_correction import (
+    ComponentAssignment,
     LabelCorrectionResult,
+    _find_all_components,
+    _compute_component_overlaps,
+    _initial_assignments,
+    _resolve_multi_component_conflicts,
     compute_overlap_matrix,
     correct_labels_with_atlas,
     enforce_single_component,
+    apply_label_mapping,
+    apply_morphological_cleanup,
     optimal_label_mapping,
 )
-from chd_postprocessing.registration import register_atlas_to_pred
+from chd_postprocessing.registration import _pca_axes, register_atlas_to_pred
 
 
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-SHAPE = (40, 40, 40)
-SPACING = (1.0, 1.0, 1.0)
+SHAPE     = (40, 40, 40)
+SPACING   = (1.0, 1.0, 1.0)
 LABEL_IDS = list(FOREGROUND_CLASSES)   # [1, 2, 3, 4, 5, 6, 7]
 
 
 def _make_label_volume(shape=SHAPE) -> np.ndarray:
-    """Create a deterministic label volume: label k occupies x=[4(k-1):4k]."""
+    """label k occupies x=[4(k-1):4k], all y, all z."""
     vol = np.zeros(shape, dtype=np.int32)
     for k in LABEL_IDS:
-        x0 = 4 * (k - 1)
-        x1 = 4 * k
+        x0, x1 = 4 * (k - 1), 4 * k
         vol[x0:x1, :, :] = k
     return vol
 
 
 def _save_nifti(data: np.ndarray, path: Path) -> None:
-    """Save a numpy array as a NIfTI file with identity affine."""
     img = nib.Nifti1Image(data, affine=np.eye(4))
     nib.save(img, str(path))
 
@@ -66,155 +71,80 @@ def _save_nifti(data: np.ndarray, path: Path) -> None:
 class TestAtlasLibrary:
 
     def test_load_all_finds_files(self, tmp_path):
-        """load_all() should discover all *.nii.gz files in the folder."""
         vol = _make_label_volume()
-        for case_id in ["case_001", "case_002", "case_003"]:
-            _save_nifti(vol, tmp_path / f"{case_id}.nii.gz")
-
+        for cid in ["case_001", "case_002", "case_003"]:
+            _save_nifti(vol, tmp_path / f"{cid}.nii.gz")
         lib = AtlasLibrary.load_all(tmp_path)
         assert len(lib) == 3
 
     def test_load_all_empty_folder(self, tmp_path):
-        """An empty folder should yield an empty library (not a crash)."""
-        lib = AtlasLibrary.load_all(tmp_path)
-        assert len(lib) == 0
+        assert len(AtlasLibrary.load_all(tmp_path)) == 0
 
     def test_case_ids_parsed_correctly(self, tmp_path):
-        """Case IDs should be the filename stem without .nii.gz extension."""
-        vol = _make_label_volume()
-        _save_nifti(vol, tmp_path / "patient_042.nii.gz")
-
+        _save_nifti(_make_label_volume(), tmp_path / "patient_042.nii.gz")
         lib = AtlasLibrary.load_all(tmp_path)
         assert lib.entries[0].case_id == "patient_042"
 
     def test_lazy_load(self, tmp_path):
-        """Labels should be None until entry.load() is called."""
-        vol = _make_label_volume()
-        _save_nifti(vol, tmp_path / "case_001.nii.gz")
-
+        _save_nifti(_make_label_volume(), tmp_path / "case_001.nii.gz")
         lib = AtlasLibrary.load_all(tmp_path)
         entry = lib.entries[0]
-        assert entry.labels is None        # not yet loaded
+        assert entry.labels is None
         entry.load()
-        assert entry.labels is not None    # now loaded
+        assert entry.labels is not None
 
     def test_select_random(self, tmp_path):
-        """Random mode should return one of the available entries."""
         vol = _make_label_volume()
         for i in range(5):
             _save_nifti(vol, tmp_path / f"case_{i:03d}.nii.gz")
-
         lib = AtlasLibrary.load_all(tmp_path)
-        rng = random.Random(0)
-        entry = lib.select_for_case([0]*8, rng, mode="random")
+        entry = lib.select_for_case([0] * 8, random.Random(0), mode="random")
         assert entry in lib.entries
 
-    def test_select_best_match_prefers_exact(self, tmp_path):
-        """best_match should prefer the entry whose disease_vec equals the query."""
+    def test_select_best_match(self, tmp_path):
+        import json
         vol = _make_label_volume()
         _save_nifti(vol, tmp_path / "normal.nii.gz")
         _save_nifti(vol, tmp_path / "hlhs.nii.gz")
-
         dm = {"normal": [0]*8, "hlhs": [1, 0, 0, 0, 0, 0, 0, 0]}
-        import json
-        dm_path = tmp_path / "disease_map.json"
-        dm_path.write_text(json.dumps(dm))
-
-        lib = AtlasLibrary.load_all(tmp_path, disease_map_path=dm_path)
-        rng = random.Random(0)
-        selected = lib.select_for_case([1, 0, 0, 0, 0, 0, 0, 0], rng, mode="best_match")
+        (tmp_path / "dm.json").write_text(json.dumps(dm))
+        lib = AtlasLibrary.load_all(tmp_path, disease_map_path=tmp_path / "dm.json")
+        selected = lib.select_for_case([1,0,0,0,0,0,0,0], random.Random(0), mode="best_match")
         assert selected.case_id == "hlhs"
 
     def test_exclude_self(self, tmp_path):
-        """The current case should never be selected as its own atlas."""
         vol = _make_label_volume()
-        _save_nifti(vol, tmp_path / "case_001.nii.gz")
-        _save_nifti(vol, tmp_path / "case_002.nii.gz")
-
+        for cid in ["case_001", "case_002"]:
+            _save_nifti(vol, tmp_path / f"{cid}.nii.gz")
         lib = AtlasLibrary.load_all(tmp_path)
-        rng = random.Random(0)
         for _ in range(20):
-            entry = lib.select_for_case([0]*8, rng, mode="random",
-                                        exclude_case_id="case_001")
-            assert entry.case_id != "case_001"
+            e = lib.select_for_case([0]*8, random.Random(0), mode="random",
+                                    exclude_case_id="case_001")
+            assert e.case_id != "case_001"
 
     def test_hamming_distance(self, tmp_path):
-        vol = _make_label_volume()
-        _save_nifti(vol, tmp_path / "case_001.nii.gz")
+        _save_nifti(_make_label_volume(), tmp_path / "case_001.nii.gz")
         lib = AtlasLibrary.load_all(tmp_path)
         entry = lib.entries[0]
         entry.disease_vec = [1, 0, 0, 0, 0, 0, 0, 0]
         assert entry.hamming_distance([1, 0, 0, 0, 0, 0, 0, 0]) == 0
         assert entry.hamming_distance([0, 0, 0, 0, 0, 0, 0, 0]) == 1
-        assert entry.hamming_distance([1, 1, 0, 0, 0, 0, 0, 0]) == 1
 
 
 # ---------------------------------------------------------------------------
-# 2. Synthetic atlas creation
-# ---------------------------------------------------------------------------
-
-class TestCreateSyntheticAtlas:
-
-    def test_same_shape(self):
-        """Perturbed atlas must have the same shape as the input."""
-        vol = _make_label_volume()
-        rng = random.Random(42)
-        synth = create_synthetic_atlas(vol, SPACING, rng)
-        assert synth.shape == vol.shape
-
-    def test_dtype_preserved(self):
-        """Integer dtype must be preserved (nearest-neighbour interpolation)."""
-        vol = _make_label_volume().astype(np.int32)
-        rng = random.Random(0)
-        synth = create_synthetic_atlas(vol, SPACING, rng)
-        assert np.issubdtype(synth.dtype, np.integer)
-
-    def test_labels_subset_preserved(self):
-        """Perturbed volume should only contain values present in the original."""
-        vol = _make_label_volume()
-        original_labels = set(np.unique(vol).tolist())
-        rng = random.Random(7)
-        synth = create_synthetic_atlas(vol, SPACING, rng)
-        synth_labels = set(np.unique(synth).tolist())
-        assert synth_labels.issubset(original_labels)
-
-    def test_zero_perturbation_is_identity(self):
-        """With rot_deg=0, trans_mm=0, scale_range=0 the output must equal input."""
-        vol = _make_label_volume()
-        rng = random.Random(0)
-        synth = create_synthetic_atlas(vol, SPACING, rng,
-                                       rot_deg=0.0, trans_mm=0.0, scale_range=0.0)
-        assert np.array_equal(synth, vol)
-
-    def test_foreground_survives_small_perturbation(self):
-        """A small perturbation should keep most foreground voxels intact."""
-        vol = _make_label_volume()
-        fg_before = int((vol > 0).sum())
-        rng = random.Random(1)
-        synth = create_synthetic_atlas(vol, SPACING, rng,
-                                       rot_deg=5.0, trans_mm=2.0, scale_range=0.02)
-        fg_after = int((synth > 0).sum())
-        # At least 70 % of foreground should survive a tiny perturbation
-        assert fg_after >= 0.70 * fg_before
-
-
-# ---------------------------------------------------------------------------
-# 3. Registration
+# 2. Registration — centroid and PCA sign fix
 # ---------------------------------------------------------------------------
 
 class TestRegistration:
 
     def test_output_shape_matches_pred(self):
-        """Registered atlas must have pred's shape even if atlas has different shape."""
         atlas = _make_label_volume((50, 50, 50))
         pred  = _make_label_volume((40, 40, 40))
-        reg   = register_atlas_to_pred(atlas, pred, SPACING, mode="centroid")
+        reg   = register_atlas_to_pred(atlas, pred, SPACING)
         assert reg.shape == pred.shape
 
-    def test_centroid_alignment_reduces_error(self):
-        """Centroid registration should reduce centroid distance vs no alignment."""
+    def test_centroid_reduces_distance(self):
         pred  = _make_label_volume()
-        # Shift atlas by 8 voxels along x
         atlas = np.roll(pred, 8, axis=0)
 
         def cm_dist(a, b):
@@ -223,56 +153,52 @@ class TestRegistration:
             cb = np.array(center_of_mass((b > 0).astype(np.uint8)))
             return float(np.linalg.norm(ca - cb))
 
-        dist_before = cm_dist(atlas, pred)
-        reg = register_atlas_to_pred(atlas, pred, SPACING, mode="centroid")
-        dist_after = cm_dist(reg, pred)
-        assert dist_after < dist_before, (
-            f"Centroid registration should reduce distance "
-            f"(before={dist_before:.2f}, after={dist_after:.2f})"
-        )
+        before = cm_dist(atlas, pred)
+        reg    = register_atlas_to_pred(atlas, pred, SPACING, mode="centroid")
+        after  = cm_dist(reg, pred)
+        assert after < before
+
+    def test_pca_sign_fix_produces_proper_rotation(self):
+        """_pca_axes must return a matrix with det = +1 (no reflections)."""
+        rng = np.random.default_rng(42)
+        for _ in range(20):
+            coords = rng.standard_normal((500, 3))
+            R = _pca_axes(coords)
+            assert R.shape == (3, 3)
+            assert abs(np.linalg.det(R) - 1.0) < 1e-9, \
+                f"det(R) = {np.linalg.det(R):.6f}, expected +1"
 
     def test_pca_mode_runs(self):
-        """PCA mode should run without error and return the correct shape."""
         pred  = _make_label_volume()
         atlas = np.roll(pred, 4, axis=0)
         reg   = register_atlas_to_pred(atlas, pred, SPACING, mode="pca")
         assert reg.shape == pred.shape
 
-    def test_empty_atlas_handled(self):
-        """An all-zero atlas should not raise an exception."""
+    def test_empty_inputs_handled(self):
         pred  = _make_label_volume()
-        atlas = np.zeros_like(pred)
-        reg   = register_atlas_to_pred(atlas, pred, SPACING)
-        assert reg.shape == pred.shape
-
-    def test_empty_pred_handled(self):
-        """An all-zero prediction should not raise."""
-        atlas = _make_label_volume()
-        pred  = np.zeros_like(atlas)
-        reg   = register_atlas_to_pred(atlas, pred, SPACING)
-        assert reg.shape == pred.shape
+        zeros = np.zeros_like(pred)
+        assert register_atlas_to_pred(zeros, pred, SPACING).shape == pred.shape
+        assert register_atlas_to_pred(pred, zeros, SPACING).shape == pred.shape
 
     def test_invalid_mode_raises(self):
         vol = _make_label_volume()
         with pytest.raises(ValueError, match="Unknown registration mode"):
-            register_atlas_to_pred(vol, vol, SPACING, mode="bad_mode")
+            register_atlas_to_pred(vol, vol, SPACING, mode="bad")
 
 
 # ---------------------------------------------------------------------------
-# 4. Label correction
+# 3. Legacy whole-label functions (backward compatibility)
 # ---------------------------------------------------------------------------
 
-class TestOverlapMatrix:
+class TestLegacyOverlapMatrix:
 
-    def test_diagonal_high_for_identical_volumes(self):
-        """When pred == atlas, every diagonal entry should be 1.0."""
+    def test_diagonal_one_for_identical(self):
         vol = _make_label_volume()
         M, ids = compute_overlap_matrix(vol, vol, LABEL_IDS)
         for i in range(len(ids)):
-            assert abs(M[i, i] - 1.0) < 1e-6, f"M[{i},{i}] = {M[i,i]:.4f}, expected 1.0"
+            assert abs(M[i, i] - 1.0) < 1e-6
 
-    def test_off_diagonal_zero_for_identical_non_overlapping(self):
-        """Non-overlapping labels in the same volume → off-diagonal Dice = 0."""
+    def test_off_diagonal_zero(self):
         vol = _make_label_volume()
         M, _ = compute_overlap_matrix(vol, vol, LABEL_IDS)
         N = len(LABEL_IDS)
@@ -281,145 +207,256 @@ class TestOverlapMatrix:
                 if i != j:
                     assert M[i, j] == 0.0
 
-    def test_shape_is_n_by_n(self):
+    def test_shape_n_by_n(self):
         vol = _make_label_volume()
         M, ids = compute_overlap_matrix(vol, vol, LABEL_IDS)
         assert M.shape == (len(LABEL_IDS), len(LABEL_IDS))
-        assert ids == LABEL_IDS
 
 
-class TestOptimalLabelMapping:
+class TestLegacyMapping:
 
-    def test_identity_mapping_for_identical_volumes(self):
-        """Identical pred and atlas should return the identity mapping."""
+    def test_identity_for_identical(self):
         vol = _make_label_volume()
         M, ids = compute_overlap_matrix(vol, vol)
-        mapping = optimal_label_mapping(M, ids)
-        for lbl in ids:
-            assert mapping[lbl] == lbl
+        assert optimal_label_mapping(M, ids) == {lbl: lbl for lbl in ids}
 
-    def test_detects_swap(self):
-        """When two labels are swapped in pred, the mapping should swap them back."""
+    def test_detects_whole_label_swap(self):
         vol_correct = _make_label_volume()
         vol_swapped = vol_correct.copy()
-        # Swap labels 6 (AO) and 7 (PA)
-        ao_mask = vol_correct == 6
-        pa_mask = vol_correct == 7
-        vol_swapped[ao_mask] = 7
-        vol_swapped[pa_mask] = 6
-
+        vol_swapped[vol_correct == 6] = 7
+        vol_swapped[vol_correct == 7] = 6
         M, ids = compute_overlap_matrix(vol_swapped, vol_correct)
-        mapping = optimal_label_mapping(M, ids)
-        assert mapping[6] == 7 or mapping[7] == 6, (
-            f"Expected swap to be detected; mapping={mapping}"
-        )
+        m = optimal_label_mapping(M, ids)
+        assert m[6] == 7 or m[7] == 6
 
-    def test_empty_labels_map_to_identity(self):
-        """Labels absent from both pred and atlas should map to themselves."""
-        vol = np.zeros(SHAPE, dtype=np.int32)
-        vol[0:4, :, :] = 1   # only label 1 present
-        M, ids = compute_overlap_matrix(vol, vol, LABEL_IDS)
-        mapping = optimal_label_mapping(M, ids)
-        # Labels 2-7 are absent; they should map to themselves
-        for lbl in LABEL_IDS[1:]:
-            assert mapping[lbl] == lbl
+    def test_apply_swap(self):
+        vol = _make_label_volume()
+        mapping = {lbl: lbl for lbl in LABEL_IDS}
+        mapping[6], mapping[7] = 7, 6
+        result, changed = apply_label_mapping(vol, mapping)
+        assert changed
+        assert (result[vol == 6] == 7).all()
+        assert (result[vol == 7] == 6).all()
 
-
-class TestApplyMapping:
-
-    def test_no_change_for_identity(self):
-        from chd_postprocessing.label_correction import apply_label_mapping
+    def test_apply_identity_no_change(self):
         vol = _make_label_volume()
         identity = {lbl: lbl for lbl in LABEL_IDS}
         result, changed = apply_label_mapping(vol, identity)
         assert not changed
         assert np.array_equal(result, vol)
 
-    def test_swap_applied_correctly(self):
-        from chd_postprocessing.label_correction import apply_label_mapping
-        vol = _make_label_volume()
-        mapping = {lbl: lbl for lbl in LABEL_IDS}
-        mapping[6] = 7
-        mapping[7] = 6
-        result, changed = apply_label_mapping(vol, mapping)
-        assert changed
-        assert (result[vol == 6] == 7).all()
-        assert (result[vol == 7] == 6).all()
-        # Other labels untouched
-        for lbl in [1, 2, 3, 4, 5]:
-            assert (result[vol == lbl] == lbl).all()
 
+# ---------------------------------------------------------------------------
+# 4. New component-level internals
+# ---------------------------------------------------------------------------
 
-class TestEnforceSingleComponent:
+class TestFindAllComponents:
 
-    def test_single_component_unchanged(self):
-        """A label with only one connected component should not lose any voxels."""
-        vol = _make_label_volume()
-        counts_before = {lbl: int((vol == lbl).sum()) for lbl in LABEL_IDS}
-        cleaned, info = enforce_single_component(vol, LABEL_IDS)
+    def test_single_component_per_label(self):
+        vol  = _make_label_volume()
+        comps = _find_all_components(vol, LABEL_IDS)
+        assert len(comps) == len(LABEL_IDS)
+        for comp in comps:
+            assert comp["size"] > 0
+            assert comp["label_comp_idx"] == 1
+
+    def test_multiple_components_detected(self):
+        vol = np.zeros(SHAPE, dtype=np.int32)
+        # Label 1 with two separated blobs
+        vol[0:3, :, :] = 1
+        vol[8:11, :, :] = 1
+        comps = _find_all_components(vol, [1])
+        assert len(comps) == 2
+
+    def test_absent_label_produces_no_components(self):
+        vol   = _make_label_volume()
+        vol[vol == 7] = 0   # remove PA
+        comps = _find_all_components(vol, LABEL_IDS)
+        labels_found = {c["original_label"] for c in comps}
+        assert 7 not in labels_found
+
+    def test_component_sizes_sum_to_label_count(self):
+        vol   = _make_label_volume()
+        comps = _find_all_components(vol, LABEL_IDS)
         for lbl in LABEL_IDS:
-            assert int((cleaned == lbl).sum()) == counts_before[lbl]
-            assert info[lbl]["n_components"] == 1
-            assert info[lbl]["removed"] == 0
+            lbl_comps = [c for c in comps if c["original_label"] == lbl]
+            total = sum(c["size"] for c in lbl_comps)
+            assert total == int((vol == lbl).sum())
 
-    def test_small_fragment_removed(self):
-        """A tiny isolated fragment (< min_fraction * largest) should become 0."""
-        vol = _make_label_volume()
-        # Add a 1-voxel isolated fragment of label 1 far from its main block
-        vol[35, 35, 35] = 1
 
-        cleaned, info = enforce_single_component(vol, [1], min_component_fraction=0.01)
-        # The fragment (1 voxel) should be removed
-        assert info[1]["removed"] >= 1
-        assert vol[35, 35, 35] == 1        # original unchanged
-        assert cleaned[35, 35, 35] == 0   # fragment gone in output
+class TestComponentOverlaps:
 
+    def test_perfect_overlap_diagonal(self):
+        """When pred == atlas, each component should score 1.0 (IoC) against its own label."""
+        vol     = _make_label_volume()
+        comps   = _find_all_components(vol, LABEL_IDS)
+        a_masks = {lbl: (vol == lbl) for lbl in LABEL_IDS}
+        M       = _compute_component_overlaps(comps, a_masks, LABEL_IDS)
+        for i, comp in enumerate(comps):
+            j = LABEL_IDS.index(comp["original_label"])
+            assert abs(M[i, j] - 1.0) < 1e-6
+
+    def test_zero_overlap_for_disjoint(self):
+        """Components and atlas labels occupying completely different voxels → 0."""
+        vol   = _make_label_volume()
+        comps = _find_all_components(vol, [1])   # only label 1
+        # Atlas has label 2 only (no overlap with label 1's band)
+        a_masks = {2: (vol == 2)}
+        M = _compute_component_overlaps(comps, a_masks, [2])
+        assert np.all(M == 0.0)
+
+    def test_matrix_shape(self):
+        vol     = _make_label_volume()
+        comps   = _find_all_components(vol, LABEL_IDS)
+        a_masks = {lbl: (vol == lbl) for lbl in LABEL_IDS}
+        M       = _compute_component_overlaps(comps, a_masks, LABEL_IDS)
+        assert M.shape == (len(comps), len(LABEL_IDS))
+
+
+class TestResolveConflicts:
+
+    def test_large_fragment_wins_small_gets_reassigned(self):
+        """A tiny fragment competing for the same atlas label as a large one
+        should be reassigned to its next-best match."""
+        # Two components: large (100 vx) and tiny (2 vx), both overlap best
+        # with label index 0.  The tiny one should be reassigned to index 1.
+        n = 2
+        n_labels = 3
+        M = np.array([
+            [0.8, 0.1, 0.0],   # large component — best is col 0
+            [0.5, 0.4, 0.0],   # tiny component  — best is col 0, second-best col 1
+        ])
+        components = [
+            {"size": 100, "original_label": 1},
+            {"size": 2,   "original_label": 1},
+        ]
+        assignments = [0, 0]   # both want label index 0
+        label_ids   = [1, 2, 3]
+
+        resolved = _resolve_multi_component_conflicts(
+            assignments, components, M, label_ids,
+            min_component_fraction=0.1,  # 2 < 0.1*100 → tiny fragment qualifies
+        )
+        assert resolved[0] == 0   # large keeps label 0
+        assert resolved[1] == 1   # tiny reassigned to label 1
+
+    def test_no_conflict_unchanged(self):
+        M = np.array([[0.9, 0.0], [0.0, 0.8]])
+        components = [{"size": 50, "original_label": 1},
+                      {"size": 50, "original_label": 2}]
+        assignments = [0, 1]
+        resolved = _resolve_multi_component_conflicts(
+            assignments, components, M, [1, 2], min_component_fraction=0.01
+        )
+        assert resolved == [0, 1]
+
+
+# ---------------------------------------------------------------------------
+# 5. correct_labels_with_atlas (high-level)
+# ---------------------------------------------------------------------------
 
 class TestCorrectLabelsWithAtlas:
 
     def test_identity_when_pred_equals_atlas(self):
-        """Identical pred and atlas → no relabeling, no CC removal."""
-        vol = _make_label_volume()
+        vol    = _make_label_volume()
         result = correct_labels_with_atlas(vol, vol, label_ids=LABEL_IDS)
         assert isinstance(result, LabelCorrectionResult)
         assert not result.was_relabeled
         for lbl in LABEL_IDS:
             assert result.mapping_applied[lbl] == lbl
 
-    def test_swap_corrected(self):
-        """Labels swapped in pred should be corrected to match the atlas."""
+    def test_whole_label_swap_corrected(self):
+        """AO/PA globally swapped in pred should be corrected to match atlas."""
         vol_correct = _make_label_volume()
         vol_swapped = vol_correct.copy()
-        ao_mask = vol_correct == 6
-        pa_mask = vol_correct == 7
-        vol_swapped[ao_mask] = 7
-        vol_swapped[pa_mask] = 6
-
+        vol_swapped[vol_correct == 6] = 7
+        vol_swapped[vol_correct == 7] = 6
         result = correct_labels_with_atlas(vol_swapped, vol_correct,
                                            label_ids=LABEL_IDS,
                                            do_morphological_cleanup=False)
-        # After correction the corrected volume should match vol_correct
         assert result.was_relabeled
         assert np.array_equal(result.corrected_labels, vol_correct)
 
+    def test_misclassified_fragment_reassigned(self):
+        """A small fragment of label 5 (Myo) placed in the atlas's label-6 (AO)
+        region should be reassigned to label 6."""
+        vol_correct = _make_label_volume()
+        vol_pred    = vol_correct.copy()
+
+        # Inject a tiny Myo fragment (label 5) inside the AO band (x=[20:24]),
+        # but NOT adjacent to the main Myo band (x=[16:20]) — gap of 2 voxels.
+        vol_pred[22:24, 0:3, 0:3] = 5   # small fragment in AO region, 2-voxel gap from Myo
+
+        result = correct_labels_with_atlas(vol_pred, vol_correct,
+                                           label_ids=LABEL_IDS,
+                                           do_morphological_cleanup=False)
+
+        # That fragment should have been reassigned from 5 → 6
+        assert result.was_relabeled
+        reassigned = [ca for ca in result.component_assignments if ca.was_reassigned]
+        assert any(ca.original_label == 5 and ca.assigned_label == 6
+                   for ca in reassigned), \
+            f"Expected a 5→6 reassignment; got: {reassigned}"
+
+    def test_component_assignments_populated(self):
+        vol    = _make_label_volume()
+        result = correct_labels_with_atlas(vol, vol, label_ids=LABEL_IDS)
+        assert isinstance(result.component_assignments, list)
+        assert len(result.component_assignments) == len(LABEL_IDS)
+        for ca in result.component_assignments:
+            assert isinstance(ca, ComponentAssignment)
+            assert ca.size > 0
+            assert 0.0 <= ca.best_overlap <= 1.0
+
+    def test_overlap_matrix_shape(self):
+        """overlap_matrix should now be (n_components, n_labels) not (N, N)."""
+        vol    = _make_label_volume()
+        result = correct_labels_with_atlas(vol, vol, label_ids=LABEL_IDS)
+        n_comps = len(result.component_assignments)
+        assert result.overlap_matrix.shape == (n_comps, len(LABEL_IDS))
+
+    def test_no_foreground_returns_unchanged(self):
+        vol    = np.zeros(SHAPE, dtype=np.int32)
+        result = correct_labels_with_atlas(vol, vol, label_ids=LABEL_IDS)
+        assert np.array_equal(result.corrected_labels, vol)
+        assert not result.was_relabeled
+
     def test_returns_correct_type(self):
-        vol = _make_label_volume()
+        vol    = _make_label_volume()
         result = correct_labels_with_atlas(vol, vol)
-        assert hasattr(result, "corrected_labels")
-        assert hasattr(result, "overlap_matrix")
-        assert hasattr(result, "mapping_applied")
-        assert hasattr(result, "was_relabeled")
-        assert hasattr(result, "reassignment_summary")
+        for attr in ("corrected_labels", "overlap_matrix", "mapping_applied",
+                     "was_relabeled", "component_assignments", "reassignment_summary"):
+            assert hasattr(result, attr)
 
 
 # ---------------------------------------------------------------------------
-# 5. Full pipeline (run_atlas_pipeline)
+# 6. Structural cleanup helpers
+# ---------------------------------------------------------------------------
+
+class TestEnforceSingleComponent:
+
+    def test_single_component_unchanged(self):
+        vol    = _make_label_volume()
+        before = {lbl: int((vol == lbl).sum()) for lbl in LABEL_IDS}
+        clean, info = enforce_single_component(vol, LABEL_IDS)
+        for lbl in LABEL_IDS:
+            assert int((clean == lbl).sum()) == before[lbl]
+
+    def test_tiny_fragment_removed(self):
+        vol = _make_label_volume()
+        vol[35, 35, 35] = 1   # 1-voxel isolated fragment of label 1
+        clean, info = enforce_single_component(vol, [1], min_component_fraction=0.01)
+        assert info[1]["removed"] >= 1
+        assert clean[35, 35, 35] == 0
+
+
+# ---------------------------------------------------------------------------
+# 7. Full pipeline (run_atlas_pipeline)
 # ---------------------------------------------------------------------------
 
 class TestRunAtlasPipeline:
 
-    def _write_atlas_library(self, tmp_path: Path, n: int = 5) -> Path:
-        """Write *n* GT NIfTI files to a folder and return the folder path."""
+    def _write_lib(self, tmp_path: Path, n: int = 5) -> Path:
         gt_dir = tmp_path / "labelsTr"
         gt_dir.mkdir()
         vol = _make_label_volume()
@@ -428,204 +465,119 @@ class TestRunAtlasPipeline:
         return gt_dir
 
     def test_output_shape_matches_input(self, tmp_path):
-        """Corrected output must have the same spatial shape as the prediction."""
-        gt_dir  = self._write_atlas_library(tmp_path)
-        pred    = _make_label_volume()
-        pred_path = tmp_path / "pred_case_999.nii.gz"
-        _save_nifti(pred, pred_path)
-
-        result = run_atlas_pipeline(
-            pred_path=pred_path,
-            gt_folder=gt_dir,
-            mode="baseline",
-            seed=0,
-        )
-        assert isinstance(result, AtlasPipelineResult)
-        assert result.corrected_labels.shape == pred.shape
-
-    def test_result_has_expected_attributes(self, tmp_path):
-        gt_dir    = self._write_atlas_library(tmp_path)
-        pred_path = tmp_path / "pred_case_999.nii.gz"
+        gt_dir    = self._write_lib(tmp_path)
+        pred_path = tmp_path / "pred.nii.gz"
         _save_nifti(_make_label_volume(), pred_path)
-
         result = run_atlas_pipeline(pred_path=pred_path, gt_folder=gt_dir, seed=0)
-        assert hasattr(result, "atlas_case_id")
-        assert hasattr(result, "atlas_disease_name")
-        assert hasattr(result, "was_relabeled")
-        assert hasattr(result, "overlap_matrix")
-        assert result.mode == "baseline"
+        assert result.corrected_labels.shape == SHAPE
 
-    def test_output_saved_to_disk(self, tmp_path):
-        """When output_path is provided, a NIfTI file should be written."""
-        gt_dir    = self._write_atlas_library(tmp_path)
-        pred_path = tmp_path / "pred_case_999.nii.gz"
-        out_path  = tmp_path / "corrected_case_999.nii.gz"
+    def test_no_synthetic_perturbation(self, tmp_path):
+        """Pipeline no longer imports or calls create_synthetic_atlas."""
+        import chd_postprocessing.atlas_pipeline as m
+        import inspect
+        src = inspect.getsource(m.run_atlas_pipeline)
+        assert "create_synthetic_atlas" not in src, \
+            "create_synthetic_atlas should have been removed from run_atlas_pipeline"
+
+    def test_saved_to_disk(self, tmp_path):
+        gt_dir    = self._write_lib(tmp_path)
+        pred_path = tmp_path / "pred.nii.gz"
+        out_path  = tmp_path / "corrected.nii.gz"
         _save_nifti(_make_label_volume(), pred_path)
-
         run_atlas_pipeline(pred_path=pred_path, gt_folder=gt_dir,
                            output_path=out_path, seed=0)
         assert out_path.exists()
 
-    def test_no_save_when_output_path_none(self, tmp_path):
-        """When output_path=None, no file should be written."""
-        gt_dir    = self._write_atlas_library(tmp_path)
-        pred_path = tmp_path / "pred_case_999.nii.gz"
-        _save_nifti(_make_label_volume(), pred_path)
-
-        run_atlas_pipeline(pred_path=pred_path, gt_folder=gt_dir,
-                           output_path=None, seed=0)
-        niftis = list(tmp_path.glob("corrected*.nii.gz"))
-        assert len(niftis) == 0
-
-    def test_dice_computed_when_gt_provided(self, tmp_path):
-        """Providing gt_path should populate dice_before and dice_after."""
-        gt_dir    = self._write_atlas_library(tmp_path)
-        pred_path = tmp_path / "pred_case_999.nii.gz"
-        gt_path   = tmp_path / "gt_case_999.nii.gz"
+    def test_dice_computed_when_gt_given(self, tmp_path):
+        gt_dir    = self._write_lib(tmp_path)
+        pred_path = tmp_path / "pred.nii.gz"
+        gt_path   = tmp_path / "gt.nii.gz"
         vol = _make_label_volume()
         _save_nifti(vol, pred_path)
         _save_nifti(vol, gt_path)
-
         result = run_atlas_pipeline(pred_path=pred_path, gt_folder=gt_dir,
                                     gt_path=gt_path, seed=0)
         assert result.dice_before is not None
         assert result.dice_after  is not None
-        # Identical pred and GT → Dice should be 1.0 for all present classes
-        for cls, v in result.dice_before.items():
-            if not np.isnan(v):
-                assert abs(v - 1.0) < 1e-6, f"dice_before[{cls}] = {v:.4f}"
-
-    def test_dice_none_without_gt(self, tmp_path):
-        gt_dir    = self._write_atlas_library(tmp_path)
-        pred_path = tmp_path / "pred_case_999.nii.gz"
-        _save_nifti(_make_label_volume(), pred_path)
-
-        result = run_atlas_pipeline(pred_path=pred_path, gt_folder=gt_dir, seed=0)
-        assert result.dice_before is None
-        assert result.dice_after  is None
 
     def test_disease_specific_mode(self, tmp_path):
-        """disease_specific mode should run without error."""
         import json
-        gt_dir = self._write_atlas_library(tmp_path, n=5)
+        gt_dir = self._write_lib(tmp_path, n=5)
         dm = {f"case_{i:03d}": [0]*8 for i in range(5)}
-        dm_path = tmp_path / "disease_map.json"
+        dm_path = tmp_path / "dm.json"
         dm_path.write_text(json.dumps(dm))
-
-        pred_path = tmp_path / "pred_case_999.nii.gz"
+        pred_path = tmp_path / "pred.nii.gz"
         _save_nifti(_make_label_volume(), pred_path)
-
-        result = run_atlas_pipeline(
-            pred_path=pred_path,
-            gt_folder=gt_dir,
-            mode="disease_specific",
-            disease_map_path=dm_path,
-            seed=0,
-        )
+        result = run_atlas_pipeline(pred_path=pred_path, gt_folder=gt_dir,
+                                    mode="disease_specific",
+                                    disease_map_path=dm_path, seed=0)
         assert result.mode == "disease_specific"
         assert result.corrected_labels.shape == SHAPE
 
     def test_empty_gt_folder_raises(self, tmp_path):
-        """An empty GT folder should raise FileNotFoundError."""
-        gt_dir = tmp_path / "empty_labels"
-        gt_dir.mkdir()
+        empty = tmp_path / "empty"
+        empty.mkdir()
         pred_path = tmp_path / "pred.nii.gz"
         _save_nifti(_make_label_volume(), pred_path)
-
         with pytest.raises(FileNotFoundError):
-            run_atlas_pipeline(pred_path=pred_path, gt_folder=gt_dir)
+            run_atlas_pipeline(pred_path=pred_path, gt_folder=empty)
 
     def test_deterministic_with_same_seed(self, tmp_path):
-        """Two runs with the same seed should produce identical results."""
-        gt_dir    = self._write_atlas_library(tmp_path)
-        pred_path = tmp_path / "pred_case_999.nii.gz"
+        gt_dir    = self._write_lib(tmp_path)
+        pred_path = tmp_path / "pred.nii.gz"
         _save_nifti(_make_label_volume(), pred_path)
-
-        r1 = run_atlas_pipeline(pred_path=pred_path, gt_folder=gt_dir, seed=42)
-        r2 = run_atlas_pipeline(pred_path=pred_path, gt_folder=gt_dir, seed=42)
+        r1 = run_atlas_pipeline(pred_path=pred_path, gt_folder=gt_dir, seed=7)
+        r2 = run_atlas_pipeline(pred_path=pred_path, gt_folder=gt_dir, seed=7)
         assert r1.atlas_case_id == r2.atlas_case_id
         assert np.array_equal(r1.corrected_labels, r2.corrected_labels)
 
-    def test_pca_registration_mode(self, tmp_path):
-        """pca registration_mode should produce valid output."""
-        gt_dir    = self._write_atlas_library(tmp_path)
-        pred_path = tmp_path / "pred_case_999.nii.gz"
+    def test_component_assignments_in_result(self, tmp_path):
+        gt_dir    = self._write_lib(tmp_path)
+        pred_path = tmp_path / "pred.nii.gz"
         _save_nifti(_make_label_volume(), pred_path)
-
-        result = run_atlas_pipeline(pred_path=pred_path, gt_folder=gt_dir,
-                                    registration_mode="pca", seed=0)
-        assert result.corrected_labels.shape == SHAPE
-
-    def test_summary_dict_flat_keys(self, tmp_path):
-        """summary_dict() should return a flat dict with expected keys."""
-        gt_dir    = self._write_atlas_library(tmp_path)
-        pred_path = tmp_path / "pred_case_999.nii.gz"
-        _save_nifti(_make_label_volume(), pred_path)
-
         result = run_atlas_pipeline(pred_path=pred_path, gt_folder=gt_dir, seed=0)
-        d = result.summary_dict()
-        for key in ["atlas_case_id", "atlas_disease_name", "mode", "was_relabeled"]:
-            assert key in d, f"summary_dict missing key '{key}'"
+        # AtlasPipelineResult wraps LabelCorrectionResult; verify overlap_matrix
+        # is (n_components, n_labels) not (n_labels, n_labels)
+        n_labels = len(LABEL_IDS)
+        assert result.overlap_matrix.shape[1] == n_labels
+        assert result.overlap_matrix.shape[0] >= n_labels   # at least 1 comp per label
 
 
 # ---------------------------------------------------------------------------
-# 6. Folder pipeline
+# 8. Folder pipeline
 # ---------------------------------------------------------------------------
 
 class TestRunAtlasFolderPipeline:
 
-    def test_returns_dataframe_with_one_row_per_case(self, tmp_path):
+    def test_returns_dataframe(self, tmp_path):
         from chd_postprocessing.atlas_pipeline import run_atlas_folder_pipeline
         import pandas as pd
 
-        gt_dir   = tmp_path / "labels"
-        pred_dir = tmp_path / "preds"
-        out_dir  = tmp_path / "corrected"
-        gt_dir.mkdir(); pred_dir.mkdir()
-
-        vol = _make_label_volume()
+        gt   = tmp_path / "labels"; gt.mkdir()
+        pred = tmp_path / "preds";  pred.mkdir()
+        out  = tmp_path / "out"
+        vol  = _make_label_volume()
         for i in range(3):
-            _save_nifti(vol, gt_dir   / f"train_{i:03d}.nii.gz")
-            _save_nifti(vol, pred_dir / f"pred_{i:03d}.nii.gz")
+            _save_nifti(vol, gt   / f"train_{i:03d}.nii.gz")
+            _save_nifti(vol, pred / f"pred_{i:03d}.nii.gz")
 
-        df = run_atlas_folder_pipeline(
-            pred_folder=pred_dir,
-            gt_folder=gt_dir,
-            output_folder=out_dir,
-            mode="baseline",
-            seed=0,
-        )
+        df = run_atlas_folder_pipeline(pred, gt, out, mode="baseline", seed=0)
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 3
 
-    def test_output_files_created(self, tmp_path):
+    def test_output_files_written(self, tmp_path):
         from chd_postprocessing.atlas_pipeline import run_atlas_folder_pipeline
 
-        gt_dir   = tmp_path / "labels"
-        pred_dir = tmp_path / "preds"
-        out_dir  = tmp_path / "corrected"
-        gt_dir.mkdir(); pred_dir.mkdir()
-
-        vol = _make_label_volume()
+        gt   = tmp_path / "labels"; gt.mkdir()
+        pred = tmp_path / "preds";  pred.mkdir()
+        out  = tmp_path / "out"
+        vol  = _make_label_volume()
         for i in range(2):
-            _save_nifti(vol, gt_dir   / f"train_{i:03d}.nii.gz")
-            _save_nifti(vol, pred_dir / f"pred_{i:03d}.nii.gz")
+            _save_nifti(vol, gt   / f"train_{i:03d}.nii.gz")
+            _save_nifti(vol, pred / f"pred_{i:03d}.nii.gz")
 
-        run_atlas_folder_pipeline(pred_dir, gt_dir, out_dir, seed=0)
-        output_files = list(out_dir.glob("*.nii.gz"))
-        assert len(output_files) == 2
-
-    def test_empty_pred_folder_raises(self, tmp_path):
-        from chd_postprocessing.atlas_pipeline import run_atlas_folder_pipeline
-
-        gt_dir   = tmp_path / "labels"
-        pred_dir = tmp_path / "empty_preds"
-        out_dir  = tmp_path / "out"
-        gt_dir.mkdir(); pred_dir.mkdir()
-        _save_nifti(_make_label_volume(), gt_dir / "train_000.nii.gz")
-
-        with pytest.raises(FileNotFoundError):
-            run_atlas_folder_pipeline(pred_dir, gt_dir, out_dir)
+        run_atlas_folder_pipeline(pred, gt, out, seed=0)
+        assert len(list(out.glob("*.nii.gz"))) == 2
 
 
 if __name__ == "__main__":

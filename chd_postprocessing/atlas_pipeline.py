@@ -47,7 +47,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from .atlas import AtlasLibrary, create_synthetic_atlas
+from .atlas import AtlasLibrary
 from .config import FOREGROUND_CLASSES, LABEL_NAMES
 from .evaluate import dice_per_class
 from .io_utils import get_disease_vec, get_voxel_spacing, load_disease_map, load_nifti, save_nifti, resolve_case_id
@@ -140,9 +140,6 @@ def run_atlas_pipeline(
     gt_path:            Optional[str | Path] = None,
     mode:               str = "baseline",
     seed:               int = 42,
-    rot_deg:            float = 10.0,
-    trans_mm:           float = 5.0,
-    scale_range:        float = 0.05,
     registration_mode:  str = "centroid",
     min_overlap:        float = 0.01,
     min_component_fraction: float = 0.01,
@@ -163,10 +160,10 @@ def run_atlas_pipeline(
     mode : ``"baseline"`` — random atlas selection;
            ``"disease_specific"`` — atlas best-matching the case's disease profile.
     seed : random seed for reproducibility.
-    rot_deg / trans_mm / scale_range : synthetic perturbation parameters.
-    registration_mode : ``"centroid"`` or ``"pca"`` (see :mod:`registration`).
-    min_overlap : Dice threshold below which a label is ignored in assignment.
-    min_component_fraction : CC fragment removal threshold.
+    registration_mode : ``"centroid"`` (default) or ``"pca"``
+                        (see :mod:`registration`).
+    min_overlap : minimum Dice for a component-atlas match to be accepted.
+    min_component_fraction : small-fragment reassignment threshold.
     do_morphological_cleanup : apply closing + hole-fill to AO and PA.
     label_ids : foreground labels to consider.  Default: 1–7.
 
@@ -179,13 +176,13 @@ def run_atlas_pipeline(
     if label_ids is None:
         label_ids = list(FOREGROUND_CLASSES)
 
-    rng = random.Random(seed)
+    rng = random.Random(seed)   # used only for atlas selection tie-breaking
 
     # ------------------------------------------------------------------
     # 1. Load prediction
     # ------------------------------------------------------------------
     pred_labels, affine, header = load_nifti(pred_path)
-    pred_labels = pred_labels.astype(np.int32)
+    pred_labels  = pred_labels.astype(np.int32)
     pred_spacing = get_voxel_spacing(header)
 
     case_id = resolve_case_id(Path(pred_path).name)
@@ -221,8 +218,7 @@ def run_atlas_pipeline(
         exclude_case_id=case_id,
     )
     atlas_entry.load()
-    atlas_labels  = atlas_entry.labels
-    atlas_spacing = atlas_entry.spacing
+    atlas_labels = atlas_entry.labels
 
     # ------------------------------------------------------------------
     # 5. Compute Dice *before* correction (optional)
@@ -235,22 +231,16 @@ def run_atlas_pipeline(
         dice_before = {LABEL_NAMES.get(k, str(k)): v for k, v in raw_scores.items()}
 
     # ------------------------------------------------------------------
-    # 6. Create synthetic atlas (small random perturbation)
-    # ------------------------------------------------------------------
-    synth_atlas = create_synthetic_atlas(
-        atlas_labels, atlas_spacing, rng,
-        rot_deg=rot_deg, trans_mm=trans_mm, scale_range=scale_range,
-    )
-
-    # ------------------------------------------------------------------
-    # 7. Register synthetic atlas → prediction space
+    # 6. Register atlas → prediction space (no synthetic perturbation;
+    #    the atlas is already a different patient so perturbation only
+    #    degrades registration accuracy)
     # ------------------------------------------------------------------
     registered_atlas = register_atlas_to_pred(
-        synth_atlas, pred_labels, pred_spacing, mode=registration_mode
+        atlas_labels, pred_labels, pred_spacing, mode=registration_mode
     )
 
     # ------------------------------------------------------------------
-    # 8. Label correction via overlap + Hungarian matching
+    # 7. Component-level label correction
     # ------------------------------------------------------------------
     correction = correct_labels_with_atlas(
         pred_labels, registered_atlas,
@@ -261,7 +251,7 @@ def run_atlas_pipeline(
     )
 
     # ------------------------------------------------------------------
-    # 9. Compute Dice *after* correction (optional)
+    # 8. Compute Dice *after* correction (optional)
     # ------------------------------------------------------------------
     dice_after = None
     if gt_path is not None:
@@ -269,7 +259,7 @@ def run_atlas_pipeline(
         dice_after = {LABEL_NAMES.get(k, str(k)): v for k, v in raw_after.items()}
 
     # ------------------------------------------------------------------
-    # 10. Save output (optional)
+    # 9. Save output (optional)
     # ------------------------------------------------------------------
     if output_path is not None:
         save_nifti(correction.corrected_labels, affine, header, output_path)
@@ -304,9 +294,6 @@ def run_atlas_folder_pipeline(
     gt_folder_eval:     Optional[str | Path] = None,
     mode:               str = "baseline",
     seed:               int = 42,
-    rot_deg:            float = 10.0,
-    trans_mm:           float = 5.0,
-    scale_range:        float = 0.05,
     registration_mode:  str = "centroid",
     file_pattern:       str = "*.nii.gz",
     **kwargs,
@@ -366,9 +353,6 @@ def run_atlas_folder_pipeline(
                 gt_path=gt_path,
                 mode=mode,
                 seed=seed + idx,   # deterministic per-case seed
-                rot_deg=rot_deg,
-                trans_mm=trans_mm,
-                scale_range=scale_range,
                 registration_mode=registration_mode,
                 **kwargs,
             )

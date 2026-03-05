@@ -5,20 +5,23 @@ Strategy
 Cardiac CT scans share a common rough orientation, so a full deformable
 registration is unnecessary.  A centroid-based rigid alignment brings the
 atlas into approximate correspondence with the prediction, which is
-sufficient for the subsequent overlap-based label correction.
+sufficient for the subsequent component-level label correction.
 
 Two modes are available:
 
-``"centroid"`` (default, fast)
+``"centroid"`` (default, recommended)
     Align the centre of mass of all foreground voxels in the atlas to the
     centre of mass of all foreground voxels in the prediction.  Pure
-    translation, no rotation.
+    translation, no rotation.  Safe for all inputs.
 
 ``"pca"``
     Align centroids *and* principal axes of the foreground point clouds.
     Adds a rotation component derived from the eigenvectors of each cloud's
-    covariance matrix.  More accurate when patient orientation varies
-    substantially, but slightly slower.
+    covariance matrix.  The sign ambiguity of eigenvectors is resolved by
+    enforcing a right-handed coordinate system (det(R) = +1), which prevents
+    180° flips that could swap left/right structures.  More accurate when
+    patient orientation varies substantially, but centroid mode is preferred
+    for typical cardiac CT data where orientation is consistent.
 """
 from __future__ import annotations
 
@@ -42,16 +45,26 @@ def _centroid(labels: np.ndarray) -> np.ndarray:
     fg = labels > 0
     if not fg.any():
         return np.array([(s - 1) / 2.0 for s in labels.shape])
-    # scipy.ndimage.center_of_mass returns (z, y, x) by default — same axis order
     return np.array(center_of_mass(fg.astype(np.uint8)))
 
 
 def _pca_axes(coords: np.ndarray) -> np.ndarray:
-    """Return the 3×3 rotation matrix whose rows are PCA axes (descending var)."""
+    """Return the 3×3 rotation matrix whose rows are PCA axes (descending var).
+
+    Sign ambiguity is resolved by enforcing a right-handed coordinate system
+    (determinant = +1).  Without this fix, eigenvectors can point in arbitrary
+    directions, causing the composed rotation R = R_pred.T @ R_atlas to be a
+    reflection (det = -1) that flips the volume and swaps laterally symmetric
+    structures such as LV/RV or AO/PA.
+    """
     centred = coords - coords.mean(axis=0)
     cov = (centred.T @ centred) / max(len(centred) - 1, 1)
-    _, vecs = np.linalg.eigh(cov)          # columns are eigenvectors, ascending order
-    return vecs[:, ::-1].T                 # rows = axes, descending variance
+    _, vecs = np.linalg.eigh(cov)       # columns = eigenvectors, ascending order
+    axes = vecs[:, ::-1].T              # rows = axes, descending variance
+    # Enforce right-handed system: flip last axis if determinant is negative
+    if np.linalg.det(axes) < 0:
+        axes[-1] *= -1
+    return axes
 
 
 def _apply_transform(
@@ -93,9 +106,8 @@ def register_atlas_to_pred(
     atlas : integer label volume (H_a × W_a × D_a).
     pred : integer label volume (H_p × W_p × D_p).
            The output will have this shape.
-    spacing : voxel spacing (mm) — used by ``"pca"`` mode to convert
-              physical-space distances; currently informational.
-    mode : ``"centroid"`` or ``"pca"`` (see module docstring).
+    spacing : voxel spacing (mm) — used by ``"pca"`` mode.
+    mode : ``"centroid"`` (default) or ``"pca"`` (see module docstring).
 
     Returns
     -------
@@ -112,7 +124,6 @@ def register_atlas_to_pred(
     atlas_fg = atlas > 0
     pred_fg  = pred  > 0
     if not atlas_fg.any() or not pred_fg.any():
-        # Cannot align — resample atlas into pred's grid and return
         if atlas.shape == pred.shape:
             return atlas.copy()
         return affine_transform(
@@ -125,7 +136,7 @@ def register_atlas_to_pred(
     # ------------------------------------------------------------------
     atlas_cm = _centroid(atlas)
     pred_cm  = _centroid(pred)
-    t_vox    = pred_cm - atlas_cm          # translation to apply in atlas space
+    t_vox    = pred_cm - atlas_cm
 
     R_identity = np.eye(3)
 
@@ -136,12 +147,15 @@ def register_atlas_to_pred(
         atlas_coords = _foreground_coords(atlas)
         pred_coords  = _foreground_coords(pred)
 
-        # Only compute PCA when there are enough points for a stable estimate
         if len(atlas_coords) >= 10 and len(pred_coords) >= 10:
-            R_atlas = _pca_axes(atlas_coords)    # rows = atlas principal axes
-            R_pred  = _pca_axes(pred_coords)     # rows = pred  principal axes
-            # R maps atlas axes → pred axes:  R = R_pred.T @ R_atlas
+            R_atlas = _pca_axes(atlas_coords)   # rows = atlas principal axes
+            R_pred  = _pca_axes(pred_coords)    # rows = pred  principal axes
+            # R maps atlas axes → pred axes
             R = R_pred.T @ R_atlas
+            # Ensure the composed rotation is proper (det = +1)
+            if np.linalg.det(R) < 0:
+                R_atlas[-1] *= -1
+                R = R_pred.T @ R_atlas
         else:
             R = R_identity
     else:
