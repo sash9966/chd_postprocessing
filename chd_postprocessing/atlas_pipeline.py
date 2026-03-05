@@ -47,6 +47,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from .anatomy_priors import correct_ao_pa_fragments
 from .atlas import AtlasLibrary
 from .config import FOREGROUND_CLASSES, LABEL_NAMES
 from .evaluate import dice_per_class
@@ -143,6 +144,7 @@ def run_atlas_pipeline(
     registration_mode:  str = "centroid",
     min_overlap:        float = 0.01,
     min_component_fraction: float = 0.01,
+    do_anatomy_correction: bool = True,
     do_morphological_cleanup: bool = True,
     label_ids:          Optional[List[int]] = None,
 ) -> AtlasPipelineResult:
@@ -162,8 +164,10 @@ def run_atlas_pipeline(
     seed : random seed for reproducibility.
     registration_mode : ``"centroid"`` (default) or ``"pca"``
                         (see :mod:`registration`).
-    min_overlap : minimum Dice for a component-atlas match to be accepted.
+    min_overlap : minimum IoC for a fragment-atlas match to be accepted.
     min_component_fraction : small-fragment reassignment threshold.
+    do_anatomy_correction : apply fragment-level AO/PA ventricle-adjacency
+                            correction *before* the atlas step.  Recommended.
     do_morphological_cleanup : apply closing + hole-fill to AO and PA.
     label_ids : foreground labels to consider.  Default: 1–7.
 
@@ -221,7 +225,17 @@ def run_atlas_pipeline(
     atlas_labels = atlas_entry.labels
 
     # ------------------------------------------------------------------
-    # 5. Compute Dice *before* correction (optional)
+    # 5. Fragment-level AO/PA anatomy correction (no registration needed)
+    #    Runs FIRST so atlas step operates on already-corrected vessel labels.
+    # ------------------------------------------------------------------
+    working_labels = pred_labels.copy()
+    if do_anatomy_correction:
+        working_labels, _ = correct_ao_pa_fragments(
+            working_labels, disease_vec, pred_spacing
+        )
+
+    # ------------------------------------------------------------------
+    # 6. Compute Dice *before* atlas correction (optional)
     # ------------------------------------------------------------------
     dice_before = None
     if gt_path is not None:
@@ -231,19 +245,17 @@ def run_atlas_pipeline(
         dice_before = {LABEL_NAMES.get(k, str(k)): v for k, v in raw_scores.items()}
 
     # ------------------------------------------------------------------
-    # 6. Register atlas → prediction space (no synthetic perturbation;
-    #    the atlas is already a different patient so perturbation only
-    #    degrades registration accuracy)
+    # 7. Register atlas → prediction space
     # ------------------------------------------------------------------
     registered_atlas = register_atlas_to_pred(
-        atlas_labels, pred_labels, pred_spacing, mode=registration_mode
+        atlas_labels, working_labels, pred_spacing, mode=registration_mode
     )
 
     # ------------------------------------------------------------------
-    # 7. Component-level label correction
+    # 8. Component-level label correction (non-dominant fragments only)
     # ------------------------------------------------------------------
     correction = correct_labels_with_atlas(
-        pred_labels, registered_atlas,
+        working_labels, registered_atlas,
         label_ids=label_ids,
         min_overlap=min_overlap,
         min_component_fraction=min_component_fraction,
@@ -251,7 +263,7 @@ def run_atlas_pipeline(
     )
 
     # ------------------------------------------------------------------
-    # 8. Compute Dice *after* correction (optional)
+    # 9. Compute Dice *after* correction (optional)
     # ------------------------------------------------------------------
     dice_after = None
     if gt_path is not None:
@@ -259,7 +271,7 @@ def run_atlas_pipeline(
         dice_after = {LABEL_NAMES.get(k, str(k)): v for k, v in raw_after.items()}
 
     # ------------------------------------------------------------------
-    # 9. Save output (optional)
+    # 10. Save output (optional)
     # ------------------------------------------------------------------
     if output_path is not None:
         save_nifti(correction.corrected_labels, affine, header, output_path)

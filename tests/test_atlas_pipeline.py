@@ -365,8 +365,10 @@ class TestCorrectLabelsWithAtlas:
         for lbl in LABEL_IDS:
             assert result.mapping_applied[lbl] == lbl
 
-    def test_whole_label_swap_corrected(self):
-        """AO/PA globally swapped in pred should be corrected to match atlas."""
+    def test_whole_label_swap_dominant_preserved(self):
+        """Dominant components are locked — global AO/PA swap is NOT corrected
+        by correct_labels_with_atlas alone.  Global swaps are handled upstream
+        by correct_ao_pa_fragments (anatomy_priors module)."""
         vol_correct = _make_label_volume()
         vol_swapped = vol_correct.copy()
         vol_swapped[vol_correct == 6] = 7
@@ -374,8 +376,9 @@ class TestCorrectLabelsWithAtlas:
         result = correct_labels_with_atlas(vol_swapped, vol_correct,
                                            label_ids=LABEL_IDS,
                                            do_morphological_cleanup=False)
-        assert result.was_relabeled
-        assert np.array_equal(result.corrected_labels, vol_correct)
+        # Dominant components locked → no relabeling from this function alone
+        assert not result.was_relabeled
+        # The full pipeline (run_atlas_pipeline) applies anatomy correction first
 
     def test_misclassified_fragment_reassigned(self):
         """A small fragment of label 5 (Myo) placed in the atlas's label-6 (AO)

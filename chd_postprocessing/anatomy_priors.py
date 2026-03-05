@@ -10,11 +10,24 @@ be spatially adjacent to the RV and the predicted "PA" region will be adjacent
 to the LV — the reverse of the expected anatomy.  This module detects that
 pattern and swaps the labels back.
 
+Two correction levels are available:
+
+``correct_ao_pa_labels`` — global correction
+    Checks whether the *entire* AO/PA prediction is on the wrong side.
+    Swaps all AO↔PA when both vessels are globally misassigned.
+
+``correct_ao_pa_fragments`` — fragment-level correction (NEW)
+    Operates on each connected component independently.  An AO fragment
+    that is adjacent to RV (but not LV) is relabeled as PA, and vice versa.
+    This handles the common case where the *main* AO/PA bodies are correct
+    but a few spatially disconnected fragments have been given the wrong
+    vessel label.  Requires no atlas registration.
+
 Disease exception
 -----------------
 In **pulmonary atresia** (PuA, flag index 5 in the disease vector) the AO and PA
 genuinely fuse or one vessel is absent, so the anatomical prior does not apply.
-Cases with PuA=1 are left untouched.
+Cases with PuA=1 are left untouched by both functions.
 """
 
 from __future__ import annotations
@@ -272,3 +285,99 @@ def correct_ao_pa_labels(
         needs_manual_review=True,
         adjacency_details=adjacency_details,
     )
+
+
+# ---------------------------------------------------------------------------
+# Fragment-level AO/PA correction (new)
+# ---------------------------------------------------------------------------
+
+def correct_ao_pa_fragments(
+    labels: np.ndarray,
+    disease_vec: Optional[List[int]],
+    spacing_mm: Tuple[float, float, float],
+    dilation_radius_mm: float = DEFAULT_DILATION_RADIUS_MM,
+) -> Tuple[np.ndarray, Dict]:
+    """Per-component AO/PA correction using ventricle-adjacency anatomy.
+
+    For each connected component of AO (label 6) and PA (label 7):
+    - An AO component adjacent primarily to RV (and not LV) is relabeled as PA.
+    - A PA component adjacent primarily to LV (and not RV) is relabeled as AO.
+
+    Components with no ventricle adjacency signal (e.g., a stray RA fragment
+    that nnU-Net mislabeled as AO) are left as-is; the atlas step handles those.
+
+    Unlike ``correct_ao_pa_labels``, this operates independently on each
+    disconnected fragment rather than the global vessel masks.  No registration
+    is needed — only binary dilation and voxel counting.
+
+    Parameters
+    ----------
+    labels : integer segmentation volume.
+    disease_vec : binary disease flags.  PuA=1 → function is a no-op.
+    spacing_mm : voxel spacing in mm.
+    dilation_radius_mm : adjacency test radius.
+
+    Returns
+    -------
+    (corrected_labels, fragment_log) where fragment_log is a list of dicts
+    describing each reassigned fragment.
+    """
+    labels = labels.copy()
+    fragment_log: Dict = {"reassigned": [], "skipped_pua": False}
+
+    if disease_vec is not None and disease_vec[PUA_FLAG_INDEX] == 1:
+        fragment_log["skipped_pua"] = True
+        return labels, fragment_log
+
+    from scipy.ndimage import label as nd_label
+
+    ao_lbl, pa_lbl = LABELS["AO"], LABELS["PA"]
+    lv_lbl, rv_lbl = LABELS["LV"], LABELS["RV"]
+
+    lv_mask = labels == lv_lbl
+    rv_mask = labels == rv_lbl
+
+    if not lv_mask.any() or not rv_mask.any():
+        return labels, fragment_log
+
+    se = _make_ellipsoid_se(dilation_radius_mm, spacing_mm)
+
+    for vessel_lbl, correct_ventricle, wrong_ventricle in [
+        (ao_lbl, lv_mask, rv_mask),   # AO should be near LV
+        (pa_lbl, rv_mask, lv_mask),   # PA should be near RV
+    ]:
+        target_lbl = pa_lbl if vessel_lbl == ao_lbl else ao_lbl
+        vessel_mask = labels == vessel_lbl
+        if not vessel_mask.any():
+            continue
+
+        labeled_vol, n = nd_label(vessel_mask)
+        for cid in range(1, n + 1):
+            comp_mask = labeled_vol == cid
+            comp_size = int(comp_mask.sum())
+
+            lv_score, rv_score, lv_cnt, rv_cnt = _adjacency_scores(
+                comp_mask, se, lv_mask, rv_mask
+            )
+
+            correct_score = lv_score if vessel_lbl == ao_lbl else rv_score
+            wrong_score   = rv_score if vessel_lbl == ao_lbl else lv_score
+
+            # No ventricle signal at all — skip (stray fragment, atlas handles it)
+            if lv_cnt == 0 and rv_cnt == 0:
+                continue
+
+            # Only reassign if the wrong ventricle dominates clearly
+            if wrong_score > correct_score:
+                labels[comp_mask] = target_lbl
+                fragment_log["reassigned"].append({
+                    "original_label":  vessel_lbl,
+                    "assigned_label":  target_lbl,
+                    "size":            comp_size,
+                    "correct_score":   round(correct_score, 4),
+                    "wrong_score":     round(wrong_score, 4),
+                    "lv_count":        lv_cnt,
+                    "rv_count":        rv_cnt,
+                })
+
+    return labels, fragment_log

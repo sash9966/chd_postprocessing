@@ -490,14 +490,41 @@ def correct_labels_with_atlas(
     # 1c. Intersection-over-component overlap: (n_components, n_labels)
     M = _compute_component_overlaps(components, atlas_masks, label_ids)
 
-    # 1d. Initial greedy assignment
-    assignments = _initial_assignments(M, components, label_ids)
+    # 1d. Conservative assignment: lock the dominant (largest) component for each
+    #     original label; only apply IoC-based reassignment to extra fragments.
+    #
+    #     Rationale: the dominant component of each label in the nnU-Net prediction
+    #     is almost certainly correct — the network has high overall accuracy.
+    #     Reassigning large correct components via an imperfectly registered atlas
+    #     introduces more errors than it fixes.  Only the secondary fragments (which
+    #     are anatomically implausible as separate structures) need correction.
+    largest_per_label: Dict[int, int] = {}  # {original_label: component_index}
+    for i, comp in enumerate(components):
+        lbl = comp["original_label"]
+        if lbl not in largest_per_label or comp["size"] > components[largest_per_label[lbl]]["size"]:
+            largest_per_label[lbl] = i
+
+    assignments: List[int] = []
+    for i, comp in enumerate(components):
+        lbl = comp["original_label"]
+        orig_j = label_ids.index(lbl)
+        if largest_per_label.get(lbl) == i:
+            # Dominant component — keep original label unconditionally
+            assignments.append(orig_j)
+        else:
+            # Extra fragment — assign to best atlas match if signal is present
+            best_j = int(np.argmax(M[i]))
+            if M[i, best_j] >= min_overlap:
+                assignments.append(best_j)
+            else:
+                assignments.append(orig_j)  # no atlas signal → keep original
 
     # ------------------------------------------------------------------
     # Phase 2: anatomical constraint enforcement
     # ------------------------------------------------------------------
 
-    # 2a. Resolve multi-component conflicts (keep largest, reassign tiny fragments)
+    # 2a. Resolve conflicts among extra fragments only
+    #     (dominant components are already locked and won't be moved)
     assignments = _resolve_multi_component_conflicts(
         assignments, components, M, label_ids, min_component_fraction
     )
