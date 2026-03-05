@@ -3,19 +3,35 @@
 from typing import Dict, List
 
 # ---------------------------------------------------------------------------
-# Segmentation label map (from imageCHD dataset.json)
+# Segmentation label map — internal short keys used throughout the codebase
+# (e.g. LABELS["AO"] = 6, LABELS["LV"] = 1)
 # ---------------------------------------------------------------------------
 LABELS: Dict[str, int] = {
     "background": 0,
-    "LV":  1,   # left ventricle
-    "RV":  2,   # right ventricle
+    "LV":  1,   # left ventricle blood pool
+    "RV":  2,   # right ventricle blood pool
     "LA":  3,   # left atrium
     "RA":  4,   # right atrium
     "Myo": 5,   # myocardium
     "AO":  6,   # aorta
     "PA":  7,   # pulmonary artery
 }
-LABEL_NAMES: Dict[int, str] = {v: k for k, v in LABELS.items()}
+
+# ---------------------------------------------------------------------------
+# Display names matching dataset.json exactly.
+# Used for all human-readable output: Dice result dicts, summary strings, CSV.
+# Kept separate from LABELS so internal key lookups (LABELS["AO"]) still work.
+# ---------------------------------------------------------------------------
+LABEL_NAMES: Dict[int, str] = {
+    0: "background",
+    1: "LV-BP",
+    2: "RV-BP",
+    3: "LA",
+    4: "RA",
+    5: "Myo",
+    6: "Aorta",
+    7: "Pulmonary",
+}
 
 # Foreground class indices (excludes background)
 FOREGROUND_CLASSES: List[int] = list(range(1, 8))
