@@ -25,7 +25,7 @@ Two modes are available:
 """
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 from scipy.ndimage import affine_transform, center_of_mass
@@ -92,6 +92,66 @@ def _apply_transform(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def register_atlas_per_structure(
+    atlas:     np.ndarray,
+    pred:      np.ndarray,
+    label_ids: List[int],
+) -> Dict[int, np.ndarray]:
+    """Per-label centroid registration — returns one aligned boolean mask per label.
+
+    Instead of a single global foreground centroid translation, each label is
+    independently shifted so that its own centroid in the atlas aligns with the
+    same label's centroid in the prediction.  This provides much better alignment
+    for structures that are far from the whole-heart centroid (AO and PA are
+    displaced in opposite directions from the centroid, so a global shift moves
+    one vessel closer and the other farther).
+
+    Parameters
+    ----------
+    atlas : integer label volume.
+    pred : integer label volume (defines output grid shape).
+    label_ids : foreground label IDs to process.
+
+    Returns
+    -------
+    ``{label_id: bool mask}`` where each mask is the atlas region for that label
+    shifted to align with the prediction, cropped/padded to ``pred.shape``.
+    Falls back to the global foreground centroid shift for labels that are absent
+    in either the atlas or the prediction.
+    """
+    output_shape = pred.shape
+    R_identity   = np.eye(3)
+    zero_center  = np.zeros(3)
+
+    # Global fallback translation (whole-foreground centroid alignment)
+    atlas_fg_cm = _centroid(atlas)
+    pred_fg_cm  = _centroid(pred)
+    t_global    = pred_fg_cm - atlas_fg_cm
+
+    result: Dict[int, np.ndarray] = {}
+    for lbl in label_ids:
+        atlas_lbl = (atlas == lbl)
+        pred_lbl  = (pred  == lbl)
+
+        if atlas_lbl.any() and pred_lbl.any():
+            atlas_cm = np.array(center_of_mass(atlas_lbl.astype(np.uint8)))
+            pred_cm  = np.array(center_of_mass(pred_lbl.astype(np.uint8)))
+            t_lbl    = pred_cm - atlas_cm
+        else:
+            t_lbl = t_global   # label absent in one volume — use global shift
+
+        # Pure translation: _apply_transform with R=I and center=0 gives offset = -t_lbl
+        shifted = _apply_transform(
+            atlas_lbl.astype(np.uint8),
+            R_identity, t_lbl,
+            center=zero_center,
+            output_shape=output_shape,
+        )
+        result[lbl] = shifted > 0
+
+    return result
+
 
 def register_atlas_to_pred(
     atlas:   np.ndarray,

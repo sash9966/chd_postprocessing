@@ -435,25 +435,34 @@ def correct_labels_with_atlas(
     pred:       np.ndarray,
     atlas_reg:  np.ndarray,
     label_ids:  Optional[List[int]] = None,
-    min_overlap: float = 0.01,
+    min_overlap: float = 0.10,
     min_component_fraction: float = MIN_COMPONENT_FRACTION,
     do_morphological_cleanup: bool = True,
+    atlas_masks_override: Optional[Dict[int, np.ndarray]] = None,
 ) -> LabelCorrectionResult:
     """Component-level atlas-guided label correction.
 
     Parameters
     ----------
     pred : predicted integer label volume.
-    atlas_reg : atlas registered into *pred*'s coordinate frame (no
-                synthetic perturbation — the atlas is already a different
-                patient).
+    atlas_reg : atlas registered into *pred*'s coordinate frame.  Used to
+                derive per-label boolean masks unless *atlas_masks_override*
+                is supplied.
     label_ids : foreground labels to consider.  Default: 1–7.
-    min_overlap : minimum Dice for the best atlas match to be accepted;
+    min_overlap : minimum IoC for the best atlas match to be accepted;
                   components below this threshold keep their original label.
+                  0.10 is the recommended minimum — with coarse centroid
+                  registration, anything below ~10% IoC is likely noise rather
+                  than a meaningful atlas signal.
     min_component_fraction : fraction of the largest component below which a
                              fragment is considered a candidate for reassignment
                              during conflict resolution.
     do_morphological_cleanup : apply closing + hole-filling after assignment.
+    atlas_masks_override : if supplied, use these pre-computed per-label boolean
+                           masks instead of deriving them from *atlas_reg*.
+                           Intended for ``registration_mode="per_structure"``
+                           where each label has been independently aligned.
+                           Dict must cover all ``label_ids``.
 
     Returns
     -------
@@ -484,8 +493,12 @@ def correct_labels_with_atlas(
         )
         return empty_result
 
-    # 1b. Precompute atlas label masks (once, reused across all components)
-    atlas_masks: Dict[int, np.ndarray] = {lbl: (atlas_reg == lbl) for lbl in label_ids}
+    # 1b. Per-label atlas masks — use override if supplied (per-structure registration),
+    #     otherwise derive from the globally-registered atlas volume.
+    if atlas_masks_override is not None:
+        atlas_masks: Dict[int, np.ndarray] = atlas_masks_override
+    else:
+        atlas_masks = {lbl: (atlas_reg == lbl) for lbl in label_ids}
 
     # 1c. Intersection-over-component overlap: (n_components, n_labels)
     M = _compute_component_overlaps(components, atlas_masks, label_ids)

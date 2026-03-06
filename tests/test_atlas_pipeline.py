@@ -474,13 +474,22 @@ class TestRunAtlasPipeline:
         result = run_atlas_pipeline(pred_path=pred_path, gt_folder=gt_dir, seed=0)
         assert result.corrected_labels.shape == SHAPE
 
-    def test_no_synthetic_perturbation(self, tmp_path):
-        """Pipeline no longer imports or calls create_synthetic_atlas."""
+    def test_perturbation_mode_wiring(self, tmp_path):
+        """Baseline applies perturbation; disease_specific does not (by default).
+
+        Verified via source inspection — both flags must exist and
+        create_synthetic_atlas must be called inside run_atlas_pipeline.
+        """
         import chd_postprocessing.atlas_pipeline as m
         import inspect
         src = inspect.getsource(m.run_atlas_pipeline)
-        assert "create_synthetic_atlas" not in src, \
-            "create_synthetic_atlas should have been removed from run_atlas_pipeline"
+        assert "do_perturbation" in src, "do_perturbation parameter must exist"
+        assert "do_anatomy_correction" in src, "do_anatomy_correction parameter must exist"
+        assert "create_synthetic_atlas" in src, \
+            "create_synthetic_atlas must be called in run_atlas_pipeline (for baseline)"
+        # Verify the mode wiring: baseline → do_perturbation=True, anatomy=False
+        assert 'mode == "baseline"' in src or "mode == 'baseline'" in src, \
+            "mode-based default wiring must reference 'baseline'"
 
     def test_saved_to_disk(self, tmp_path):
         gt_dir    = self._write_lib(tmp_path)
