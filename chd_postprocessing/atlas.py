@@ -140,12 +140,21 @@ class AtlasLibrary:
                ``"best_match"`` — minimise Hamming distance to *disease_vec*.
         exclude_case_id : if provided, never select this case (avoids
                           selecting the test case itself as its own atlas).
+                          The ``_image`` suffix is stripped before comparison
+                          so ``ct_1042`` correctly excludes ``ct_1042_image``.
 
         Returns
         -------
         :class:`AtlasEntry` (not yet loaded into memory).
         """
-        pool = [e for e in self.entries if e.case_id != exclude_case_id]
+        def _base(cid: str) -> str:
+            return cid[:-6] if cid.endswith("_image") else cid
+
+        exclude_base = _base(exclude_case_id) if exclude_case_id else None
+        pool = [
+            e for e in self.entries
+            if exclude_base is None or _base(e.case_id) != exclude_base
+        ]
         if not pool:
             pool = list(self.entries)   # fallback: allow self-match
 

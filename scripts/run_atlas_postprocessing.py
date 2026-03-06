@@ -57,12 +57,6 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Registration strategy.")
     p.add_argument("--seed",        type=int, default=42,
                    help="Random seed.")
-    p.add_argument("--rot-deg",     type=float, default=10.0,
-                   help="Max rotation per axis for synthetic atlas (degrees).")
-    p.add_argument("--trans-mm",    type=float, default=5.0,
-                   help="Max translation per axis for synthetic atlas (mm).")
-    p.add_argument("--scale-range", type=float, default=0.05,
-                   help="Max relative scale change for synthetic atlas.")
     p.add_argument("--min-overlap", type=float, default=0.01,
                    help="Minimum Dice for a label to participate in reassignment.")
     p.add_argument("--no-morphology", action="store_true",
@@ -87,9 +81,6 @@ def main() -> None:
         disease_map_path=args.disease_map,
         mode=args.mode,
         seed=args.seed,
-        rot_deg=args.rot_deg,
-        trans_mm=args.trans_mm,
-        scale_range=args.scale_range,
         registration_mode=args.registration_mode,
         min_overlap=args.min_overlap,
         do_morphological_cleanup=not args.no_morphology,
