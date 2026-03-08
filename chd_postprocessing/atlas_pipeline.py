@@ -1,35 +1,45 @@
 """Atlas-based post-processing pipeline.
 
-Two experimental conditions
----------------------------
+Three experimental conditions
+------------------------------
 
-Condition 1 — Baseline  (``mode="baseline"``)
+Condition 1 — Random atlas  (``mode="random_atlas"``, alias ``"baseline"``)
     Simulates having no disease knowledge at inference time.
 
-    * **Atlas selection**: random from the GT training library.
+    * **Atlas selection**: uniform-random from the GT training library.
     * **Perturbation**: ``create_synthetic_atlas`` is applied (±10° rotation,
-      ±5 mm translation, ±5 % scale).  This simulates a generic, imperfect
-      reference atlas and keeps the registration step non-trivial.
-    * **Registration**: global centroid alignment (or ``"pca"`` / ``"per_structure"``
-      if requested).
-    * **Anatomy correction**: *skipped* — the baseline measures atlas-only
-      correction without any anatomical shortcuts.
+      ±5 mm translation, ±5 % scale) to simulate a generic, imperfect
+      reference atlas and keep the registration step non-trivial.
+    * **Anatomy correction**: *skipped*.
+    * **Adjacency correction**: *skipped*.
     * **IoC label correction**: component-level assignment for non-dominant
       fragments only.
 
-Condition 2 — Disease-specific  (``mode="disease_specific"``)
-    Simulates having matched disease knowledge.
+Condition 2 — Disease atlas  (``mode="disease_atlas"``)
+    Adds disease-matched atlas selection; no rule-based corrections.
 
     * **Atlas selection**: minimum Hamming distance on the 8-element disease
-      flag vector — the atlas already represents the correct anatomical
-      variation for this disease.
-    * **Perturbation**: *skipped* — the disease-matched atlas should be used
-      as-is; perturbing it introduces noise without benefit.
-    * **Anatomy correction**: ``correct_ao_pa_fragments`` runs *first*
-      (PuA cases automatically skipped inside that function).
+      flag vector.
+    * **Perturbation**: *skipped* — the disease-matched atlas is used as-is.
+    * **Anatomy correction**: *skipped* — isolates the atlas-matching gain.
+    * **Adjacency correction**: *skipped*.
     * **IoC label correction**: component-level assignment for non-dominant
-      fragments only.  For PuA cases the disease-matched atlas will have fused
-      AO/PA anatomy, so the IoC step naturally respects that morphology.
+      fragments only.
+
+Condition 3 — Disease atlas + rules  (``mode="disease_atlas_rules"``,
+alias ``"disease_specific"``)
+    Adds disease-aware anatomy priors and adjacency-graph correction on top of
+    condition 2.
+
+    * **Atlas selection**: same as condition 2 (minimum Hamming distance).
+    * **Perturbation**: *skipped*.
+    * **Anatomy correction**: ``correct_ao_pa_fragments`` runs *first*
+      using disease-aware rules (TGA reversed, DORV both-from-RV, ToF
+      unconstrained AO, HLHS/PuA skipped).
+    * **Adjacency correction**: ``correct_by_adjacency`` runs after IoC
+      correction as a final structural refinement.
+    * **IoC label correction**: component-level assignment for non-dominant
+      fragments only.
 
 Usage
 -----
@@ -40,7 +50,7 @@ Single file::
         pred_path        = "pred.nii.gz",
         gt_folder        = "atlases/",          # pre-built disease atlas library
         output_path      = "corrected.nii.gz",
-        mode             = "disease_specific",
+        mode             = "disease_atlas_rules",
         disease_map_path = "disease_map.json",
         gt_path          = "gt.nii.gz",         # optional, enables Dice evaluation
     )
@@ -49,7 +59,7 @@ Whole folder::
 
     from chd_postprocessing.atlas_pipeline import run_atlas_folder_pipeline
     df = run_atlas_folder_pipeline("preds/", "atlases/", "corrected/",
-                                   mode="disease_specific",
+                                   mode="disease_atlas_rules",
                                    disease_map_path="disease_map.json")
 """
 from __future__ import annotations
@@ -62,6 +72,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from .adjacency_correction import correct_by_adjacency
 from .anatomy_priors import correct_ao_pa_fragments
 from .atlas import AtlasLibrary, create_synthetic_atlas
 from .config import FOREGROUND_CLASSES, LABEL_NAMES
@@ -109,8 +120,9 @@ class AtlasPipelineResult:
     label_ids:            List[int]
     component_info:       Dict
 
-    dice_before: Optional[Dict[str, float]] = None
-    dice_after:  Optional[Dict[str, float]] = None
+    dice_before:    Optional[Dict[str, float]] = None
+    dice_after:     Optional[Dict[str, float]] = None
+    adjacency_log:  Optional[List[Dict]]       = None
 
     def dice_delta(self) -> Optional[Dict[str, float]]:
         """Per-class Dice improvement (after − before).  None if GT unavailable."""
@@ -154,13 +166,14 @@ def run_atlas_pipeline(
     output_path:        Optional[str | Path] = None,
     disease_map_path:   Optional[str | Path] = None,
     gt_path:            Optional[str | Path] = None,
-    mode:               str = "baseline",
+    mode:               str = "random_atlas",
     seed:               int = 42,
     registration_mode:  str = "centroid",
     min_overlap:        float = 0.10,
     min_component_fraction: float = 0.01,
     do_perturbation:    Optional[bool] = None,
     do_anatomy_correction: Optional[bool] = None,
+    do_adjacency_correction: Optional[bool] = None,
     do_morphological_cleanup: bool = True,
     label_ids:          Optional[List[int]] = None,
 ) -> AtlasPipelineResult:
@@ -173,27 +186,37 @@ def run_atlas_pipeline(
                 or raw training GT folder).
     output_path : where to save the corrected NIfTI.  Skipped if ``None``.
     disease_map_path : path to ``disease_map.json``.
-                       Required for ``mode="disease_specific"``.
+                       Required for disease-matched modes.
     gt_path : ground-truth segmentation for the current case.
               When supplied, Dice scores before/after correction are computed.
-    mode : ``"baseline"`` or ``"disease_specific"`` — controls atlas selection
-           and the default values of *do_perturbation* and *do_anatomy_correction*.
+    mode : one of ``"random_atlas"``, ``"disease_atlas"``,
+           ``"disease_atlas_rules"`` (or the backward-compatible aliases
+           ``"baseline"`` → ``"random_atlas"`` and
+           ``"disease_specific"`` → ``"disease_atlas_rules"``).
+           Controls atlas selection and the default values of the three
+           *do_** flags below.
+
+           ================================  ==========  =======  =========
+           mode                              perturbation anatomy  adjacency
+           ================================  ==========  =======  =========
+           random_atlas  (baseline)          True        False    False
+           disease_atlas                     False       False    False
+           disease_atlas_rules               False       True     True
+           (disease_specific)
+           ================================  ==========  =======  =========
+
     seed : random seed for reproducibility (atlas selection + perturbation).
     registration_mode : ``"centroid"`` (default), ``"pca"``, or
-                        ``"per_structure"`` (per-label centroid alignment —
-                        better for structures far from the whole-heart centroid).
+                        ``"per_structure"`` (per-label centroid alignment).
     min_overlap : minimum IoC for the best atlas match to be accepted when
-                  reassigning a non-dominant fragment.  0.10 prevents noise
-                  assignments under coarse centroid registration.
+                  reassigning a non-dominant fragment.  Default 0.10 prevents
+                  noise assignments under coarse centroid registration.
     min_component_fraction : small-fragment conflict-resolution threshold.
-    do_perturbation : whether to apply ``create_synthetic_atlas`` random
-                      deformation before registration.
-                      Default (``None``) → ``True`` for ``"baseline"``,
-                      ``False`` for ``"disease_specific"``.
-    do_anatomy_correction : whether to run fragment-level AO/PA ventricle-
-                            adjacency correction before the atlas step.
-                            Default (``None``) → ``False`` for ``"baseline"``,
-                            ``True`` for ``"disease_specific"``.
+    do_perturbation : override the mode default for atlas perturbation.
+    do_anatomy_correction : override the mode default for AO/PA fragment
+                            correction (disease-aware rules applied).
+    do_adjacency_correction : override the mode default for adjacency-graph
+                              correction (runs after IoC step).
     do_morphological_cleanup : apply binary closing + hole-fill to AO and PA.
     label_ids : foreground labels to consider.  Default: 1–7.
 
@@ -201,16 +224,30 @@ def run_atlas_pipeline(
     -------
     :class:`AtlasPipelineResult`
     """
-    if mode not in {"baseline", "disease_specific"}:
-        raise ValueError(f"Unknown mode: {mode!r}. Use 'baseline' or 'disease_specific'.")
+    # Backward-compatible mode aliases
+    _MODE_ALIASES = {
+        "baseline":        "random_atlas",
+        "disease_specific": "disease_atlas_rules",
+    }
+    mode = _MODE_ALIASES.get(mode, mode)
+
+    _VALID_MODES = {"random_atlas", "disease_atlas", "disease_atlas_rules"}
+    if mode not in _VALID_MODES:
+        raise ValueError(
+            f"Unknown mode: {mode!r}. "
+            f"Use one of {sorted(_VALID_MODES)} (or 'baseline'/'disease_specific')."
+        )
+
     if label_ids is None:
         label_ids = list(FOREGROUND_CLASSES)
 
     # Apply per-mode defaults for unset flags
     if do_perturbation is None:
-        do_perturbation = (mode == "baseline")
+        do_perturbation = (mode == "random_atlas")
     if do_anatomy_correction is None:
-        do_anatomy_correction = (mode == "disease_specific")
+        do_anatomy_correction = (mode == "disease_atlas_rules")
+    if do_adjacency_correction is None:
+        do_adjacency_correction = (mode == "disease_atlas_rules")
 
     rng = random.Random(seed)   # seeded once; used for atlas selection then perturbation
 
@@ -246,12 +283,15 @@ def run_atlas_pipeline(
     # ------------------------------------------------------------------
     # 4. Select atlas
     # ------------------------------------------------------------------
-    selection_mode = "best_match" if mode == "disease_specific" else "random"
+    selection_mode = "random" if mode == "random_atlas" else "best_match"
+    # Exclude both the plain case ID and the _image variant so that the
+    # test case is never selected as its own atlas regardless of filename style.
+    _base_id = case_id[:-6] if case_id.endswith("_image") else case_id
     atlas_entry = library.select_for_case(
         disease_vec=disease_vec,
         rng=rng,
         mode=selection_mode,
-        exclude_case_id=case_id,
+        exclude_case_ids=[case_id, _base_id, _base_id + "_image"],
     )
     atlas_entry.load()
     atlas_labels = atlas_entry.labels
@@ -319,21 +359,36 @@ def run_atlas_pipeline(
     )
 
     # ------------------------------------------------------------------
+    # 9.5 Adjacency-graph correction (disease_atlas_rules mode only)
+    #     Runs after IoC correction as a structural refinement step.
+    # ------------------------------------------------------------------
+    adjacency_log: Optional[List[Dict]] = None
+    final_labels = correction.corrected_labels
+    if do_adjacency_correction:
+        final_labels, adjacency_log = correct_by_adjacency(
+            correction.corrected_labels,
+            registered_atlas,
+            label_ids=label_ids,
+            disease_vec=disease_vec,
+            min_component_fraction=min_component_fraction,
+        )
+
+    # ------------------------------------------------------------------
     # 10. Compute Dice *after* correction (optional)
     # ------------------------------------------------------------------
     dice_after = None
     if gt_path is not None:
-        raw_after = dice_per_class(correction.corrected_labels, gt_labels, label_ids)
+        raw_after = dice_per_class(final_labels, gt_labels, label_ids)
         dice_after = {LABEL_NAMES.get(k, str(k)): v for k, v in raw_after.items()}
 
     # ------------------------------------------------------------------
     # 11. Save output (optional)
     # ------------------------------------------------------------------
     if output_path is not None:
-        save_nifti(correction.corrected_labels, affine, header, output_path)
+        save_nifti(final_labels, affine, header, output_path)
 
     return AtlasPipelineResult(
-        corrected_labels=correction.corrected_labels,
+        corrected_labels=final_labels,
         affine=affine,
         header=header,
         atlas_case_id=atlas_entry.case_id,
@@ -347,6 +402,7 @@ def run_atlas_pipeline(
         component_info=correction.component_info,
         dice_before=dice_before,
         dice_after=dice_after,
+        adjacency_log=adjacency_log,
     )
 
 

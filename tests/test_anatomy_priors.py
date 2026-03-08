@@ -25,7 +25,7 @@ In the **swapped** layout, AO and PA positions are exchanged.
 import numpy as np
 import pytest
 
-from chd_postprocessing.anatomy_priors import correct_ao_pa_labels
+from chd_postprocessing.anatomy_priors import correct_ao_pa_labels, correct_ao_pa_fragments
 from chd_postprocessing.config import LABELS, PUA_FLAG_INDEX
 
 
@@ -205,6 +205,120 @@ def test_anisotropic_spacing():
     # Should not raise; result should be a CorrectionResult
     assert hasattr(result, "corrected_labels")
     assert result.corrected_labels.shape == vol.shape
+
+
+# ---------------------------------------------------------------------------
+# Disease-aware tests for correct_ao_pa_fragments
+# ---------------------------------------------------------------------------
+
+def _make_fragment_volume() -> np.ndarray:
+    """60×60×60 volume with clear vessel-ventricle geometry for fragment tests."""
+    vol = np.zeros((60, 60, 60), dtype=np.int32)
+    vol[5:25,  5:25, 5:55] = LABELS["LV"]   # left
+    vol[35:55, 5:25, 5:55] = LABELS["RV"]   # right
+    # Correct AO near LV, PA near RV
+    vol[5:25,  25:45, 5:55] = LABELS["AO"]
+    vol[35:55, 25:45, 5:55] = LABELS["PA"]
+    return vol
+
+
+DISEASE_VEC_TGA  = [0] * 8; DISEASE_VEC_TGA[7]  = 1
+DISEASE_VEC_DORV = [0] * 8; DISEASE_VEC_DORV[4] = 1
+DISEASE_VEC_TOF  = [0] * 8; DISEASE_VEC_TOF[6]  = 1
+DISEASE_VEC_HLHS = [0] * 8; DISEASE_VEC_HLHS[0] = 1
+DISEASE_VEC_PUA_TOF = [0] * 8
+DISEASE_VEC_PUA_TOF[PUA_FLAG_INDEX] = 1
+DISEASE_VEC_PUA_TOF[6] = 1
+
+
+def test_tga_ao_near_rv_not_swapped():
+    """TGA: AO should be near RV; a fragment near RV must NOT be relabelled."""
+    vol = _make_fragment_volume()
+    # Add an AO fragment near RV (correct for TGA)
+    vol[37:43, 27:33, 5:55] = LABELS["AO"]
+
+    corrected, log = correct_ao_pa_fragments(vol, DISEASE_VEC_TGA, SPACING_MM)
+
+    # The fragment adjacent to RV should remain AO (correct under TGA)
+    frag_region = corrected[37:43, 27:33, 5:55]
+    assert np.all(frag_region == LABELS["AO"]), (
+        "Under TGA, AO near RV should not be relabelled (it is anatomically correct)"
+    )
+
+
+def test_tga_pa_near_rv_relabelled():
+    """TGA: PA should be near LV; a PA fragment near RV is wrong and should be relabelled."""
+    vol = np.zeros((60, 60, 60), dtype=np.int32)
+    vol[5:25,  5:25, 5:55] = LABELS["LV"]
+    vol[35:55, 5:25, 5:55] = LABELS["RV"]
+    # TGA: AO exits RV, PA exits LV — so main bodies placed accordingly
+    vol[35:55, 25:45, 5:55] = LABELS["AO"]   # correct under TGA
+    vol[5:25,  25:45, 5:55] = LABELS["PA"]   # correct under TGA
+    # Add a PA fragment near RV (wrong for TGA — PA should be near LV)
+    vol[37:43, 27:33, 5:55] = LABELS["PA"]
+
+    corrected, log = correct_ao_pa_fragments(vol, DISEASE_VEC_TGA, SPACING_MM)
+
+    # Fragment near RV should have been relabelled away from PA
+    frag_region = corrected[37:43, 27:33, 5:55]
+    assert not np.all(frag_region == LABELS["PA"]), (
+        "Under TGA, PA near RV should be relabelled (PA should be near LV in TGA)"
+    )
+
+
+def test_dorv_ao_near_rv_not_relabelled():
+    """DORV: both vessels exit RV; AO near RV must not be relabelled."""
+    vol = _make_fragment_volume()
+    # Inject AO fragment near RV (correct for DORV)
+    vol[37:43, 27:33, 5:55] = LABELS["AO"]
+
+    corrected, log = correct_ao_pa_fragments(vol, DISEASE_VEC_DORV, SPACING_MM)
+
+    frag_region = corrected[37:43, 27:33, 5:55]
+    assert np.all(frag_region == LABELS["AO"]), (
+        "Under DORV, AO near RV should not be relabelled (both vessels exit RV)"
+    )
+
+
+def test_tof_ao_unconstrained_no_relabelling():
+    """ToF: AO is unconstrained (overriding aorta); no AO fragment should be relabelled."""
+    vol = _make_fragment_volume()
+    # Inject AO fragment near RV (would be wrong for normal but is fine for ToF)
+    vol[37:43, 27:33, 5:55] = LABELS["AO"]
+
+    corrected, log = correct_ao_pa_fragments(vol, DISEASE_VEC_TOF, SPACING_MM)
+
+    frag_region = corrected[37:43, 27:33, 5:55]
+    # AO is unconstrained in ToF, so no AO relabelling should happen at all
+    assert log["reassigned"] == [] or all(
+        entry["original_label"] != LABELS["AO"] for entry in log["reassigned"]
+    ), "Under ToF, AO fragments must not be relabelled (unconstrained)"
+
+
+def test_hlhs_correction_skipped():
+    """HLHS: skip_ao_pa_correction=True; volume returned unchanged."""
+    vol = _make_fragment_volume()
+    original = vol.copy()
+
+    corrected, log = correct_ao_pa_fragments(vol, DISEASE_VEC_HLHS, SPACING_MM)
+
+    assert np.array_equal(corrected, original), (
+        "HLHS=1: correction must be skipped; volume must be returned unchanged"
+    )
+    assert log["skipped_disease"] is True, "skipped_disease flag must be True for HLHS"
+
+
+def test_pua_plus_tof_skip_wins():
+    """PuA+ToF: PuA has skip_ao_pa_correction=True; correction must be skipped."""
+    vol = _make_fragment_volume()
+    original = vol.copy()
+
+    corrected, log = correct_ao_pa_fragments(vol, DISEASE_VEC_PUA_TOF, SPACING_MM)
+
+    assert np.array_equal(corrected, original), (
+        "PuA+ToF: PuA skip_ao_pa_correction wins; volume must be unchanged"
+    )
+    assert log["skipped_disease"] is True, "skipped_disease flag must be True for PuA+ToF"
 
 
 if __name__ == "__main__":

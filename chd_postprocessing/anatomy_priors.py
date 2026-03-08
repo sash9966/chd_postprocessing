@@ -16,18 +16,28 @@ Two correction levels are available:
     Checks whether the *entire* AO/PA prediction is on the wrong side.
     Swaps all AO↔PA when both vessels are globally misassigned.
 
-``correct_ao_pa_fragments`` — fragment-level correction (NEW)
+``correct_ao_pa_fragments`` — fragment-level correction
     Operates on each connected component independently.  An AO fragment
     that is adjacent to RV (but not LV) is relabeled as PA, and vice versa.
     This handles the common case where the *main* AO/PA bodies are correct
     but a few spatially disconnected fragments have been given the wrong
     vessel label.  Requires no atlas registration.
 
-Disease exception
------------------
-In **pulmonary atresia** (PuA, flag index 5 in the disease vector) the AO and PA
-genuinely fuse or one vessel is absent, so the anatomical prior does not apply.
-Cases with PuA=1 are left untouched by both functions.
+Disease-aware exceptions
+------------------------
+Each function checks :data:`~chd_postprocessing.config.DISEASE_ANATOMY_RULES`
+before applying any correction:
+
+* **HLHS** (flag 0) and **PuA** (flag 5): correction is skipped entirely
+  (``skip_ao_pa_correction=True``).
+* **TGA** (flag 7): AO expected near RV, PA near LV (vessels transposed).
+* **DORV** (flag 4): both AO and PA exit the RV.
+* **ToF** (flag 6): AO is unconstrained (overriding aorta straddles VSD);
+  only PA is constrained to the RV.
+
+When multiple disease flags are active the **most permissive** rule wins:
+a vessel is unconstrained if *any* active disease flags it as unconstrained,
+and a vessel's allowed ventricle set is the union across all active rules.
 """
 
 from __future__ import annotations
@@ -42,6 +52,7 @@ from scipy.ndimage import binary_dilation
 from .config import (
     CONFIDENCE_THRESHOLD,
     DEFAULT_DILATION_RADIUS_MM,
+    DISEASE_ANATOMY_RULES,
     LABELS,
     PUA_FLAG_INDEX,
 )
@@ -160,20 +171,63 @@ def correct_ao_pa_labels(
     labels = labels.copy()
 
     # ------------------------------------------------------------------
-    # 1. Skip pulmonary atresia cases — AO/PA fusion is expected.
+    # 1. Check disease-specific skip conditions.
     # ------------------------------------------------------------------
-    if disease_vec is not None and disease_vec[PUA_FLAG_INDEX] == 1:
+    if disease_vec is not None:
+        for flag_idx, is_active in enumerate(disease_vec):
+            if is_active and flag_idx in DISEASE_ANATOMY_RULES:
+                rule = DISEASE_ANATOMY_RULES[flag_idx]
+                if rule.get("skip_ao_pa_correction", False):
+                    return CorrectionResult(
+                        corrected_labels=labels,
+                        was_swapped=False,
+                        skipped_reason=(
+                            f"{rule['name']}=1: {rule['notes']}; correction skipped"
+                        ),
+                        confidence_score=1.0,
+                        needs_manual_review=False,
+                        adjacency_details={},
+                    )
+
+    ao_lbl, pa_lbl = LABELS["AO"], LABELS["PA"]
+    lv_lbl, rv_lbl = LABELS["LV"], LABELS["RV"]
+
+    # ------------------------------------------------------------------
+    # 2. Resolve effective vessel→ventricle map from active disease flags.
+    #    ao_expected_ventricle / pa_expected_ventricle:
+    #      None  → unconstrained (skip adjacency check for this vessel)
+    #      int   → the single ventricle label the vessel should be near
+    # ------------------------------------------------------------------
+    ao_expected_ventricle: Optional[int] = lv_lbl   # normal: AO → LV
+    pa_expected_ventricle: Optional[int] = rv_lbl   # normal: PA → RV
+
+    if disease_vec is not None:
+        for flag_idx, is_active in enumerate(disease_vec):
+            if is_active and flag_idx in DISEASE_ANATOMY_RULES:
+                vv = DISEASE_ANATOMY_RULES[flag_idx].get("vessel_ventricle", {})
+                if ao_lbl in vv:
+                    val = vv[ao_lbl]
+                    if val is None:
+                        ao_expected_ventricle = None  # unconstrained
+                    elif ao_expected_ventricle is not None:
+                        ao_expected_ventricle = val   # override
+                if pa_lbl in vv:
+                    val = vv[pa_lbl]
+                    if val is None:
+                        pa_expected_ventricle = None
+                    elif pa_expected_ventricle is not None:
+                        pa_expected_ventricle = val
+
+    # If both vessels are unconstrained there is nothing to check
+    if ao_expected_ventricle is None and pa_expected_ventricle is None:
         return CorrectionResult(
             corrected_labels=labels,
             was_swapped=False,
-            skipped_reason="PuA=1: AO/PA fusion is anatomically expected; correction skipped",
+            skipped_reason="Both vessels are unconstrained for this disease; correction skipped",
             confidence_score=1.0,
             needs_manual_review=False,
             adjacency_details={},
         )
-
-    ao_lbl, pa_lbl = LABELS["AO"], LABELS["PA"]
-    lv_lbl, rv_lbl = LABELS["LV"], LABELS["RV"]
 
     ao_mask = labels == ao_lbl
     pa_mask = labels == pa_lbl
@@ -181,7 +235,7 @@ def correct_ao_pa_labels(
     rv_mask = labels == rv_lbl
 
     # ------------------------------------------------------------------
-    # 2. Edge cases — missing structures.
+    # 3. Edge cases — missing structures.
     # ------------------------------------------------------------------
     if not ao_mask.any() or not pa_mask.any():
         return CorrectionResult(
@@ -210,12 +264,12 @@ def correct_ao_pa_labels(
         )
 
     # ------------------------------------------------------------------
-    # 3. Build structuring element (physical-space sphere).
+    # 4. Build structuring element (physical-space sphere).
     # ------------------------------------------------------------------
     se = _make_ellipsoid_se(dilation_radius_mm, spacing_mm)
 
     # ------------------------------------------------------------------
-    # 4. Compute adjacency scores.
+    # 5. Compute adjacency scores.
     # ------------------------------------------------------------------
     ao_lv_score, ao_rv_score, ao_lv_cnt, ao_rv_cnt = _adjacency_scores(
         ao_mask, se, lv_mask, rv_mask
@@ -224,35 +278,51 @@ def correct_ao_pa_labels(
         pa_mask, se, lv_mask, rv_mask
     )
 
-    # "Correct" means:  AO is more adjacent to LV  (ao_lv_score > 0.5)
-    #                   PA is more adjacent to RV  (pa_rv_score > 0.5)
-    ao_correct = ao_lv_score >= ao_rv_score
-    pa_correct = pa_rv_score >= pa_lv_score
-
-    # Confidence: mean distance from the ambiguous midpoint (0.5), scaled to [0,1]
-    ao_confidence = abs(ao_lv_score - 0.5) * 2   # 0 = chance, 1 = certain
-    pa_confidence = abs(pa_rv_score - 0.5) * 2
-    confidence_score = float((ao_confidence + pa_confidence) / 2)
-    needs_review = confidence_score < confidence_threshold
-
     adjacency_details: Dict = {
         "ao_lv_count":    ao_lv_cnt,
         "ao_rv_count":    ao_rv_cnt,
-        "ao_lv_score":    round(ao_lv_score, 4),   # high → AO near LV (correct)
+        "ao_lv_score":    round(ao_lv_score, 4),
         "ao_rv_score":    round(ao_rv_score, 4),
         "pa_lv_count":    pa_lv_cnt,
         "pa_rv_count":    pa_rv_cnt,
         "pa_lv_score":    round(pa_lv_score, 4),
-        "pa_rv_score":    round(pa_rv_score, 4),   # high → PA near RV (correct)
-        "ao_confidence":  round(ao_confidence, 4),
-        "pa_confidence":  round(pa_confidence, 4),
+        "pa_rv_score":    round(pa_rv_score, 4),
     }
 
     # ------------------------------------------------------------------
-    # 5. Decide: swap, keep, or flag.
+    # 6. Evaluate correctness using the disease-resolved ventricle map.
+    # ------------------------------------------------------------------
+    # ao_correct: True if AO is near its expected ventricle (or unconstrained)
+    # pa_correct: True if PA is near its expected ventricle (or unconstrained)
+    if ao_expected_ventricle is None:
+        ao_correct = True
+        ao_confidence = 1.0
+    elif ao_expected_ventricle == lv_lbl:
+        ao_correct = ao_lv_score >= ao_rv_score
+        ao_confidence = abs(ao_lv_score - 0.5) * 2
+    else:  # ao_expected_ventricle == rv_lbl (e.g. TGA, DORV)
+        ao_correct = ao_rv_score >= ao_lv_score
+        ao_confidence = abs(ao_rv_score - 0.5) * 2
+
+    if pa_expected_ventricle is None:
+        pa_correct = True
+        pa_confidence = 1.0
+    elif pa_expected_ventricle == rv_lbl:
+        pa_correct = pa_rv_score >= pa_lv_score
+        pa_confidence = abs(pa_rv_score - 0.5) * 2
+    else:  # pa_expected_ventricle == lv_lbl (e.g. TGA)
+        pa_correct = pa_lv_score >= pa_rv_score
+        pa_confidence = abs(pa_lv_score - 0.5) * 2
+
+    adjacency_details["ao_confidence"] = round(ao_confidence, 4)
+    adjacency_details["pa_confidence"] = round(pa_confidence, 4)
+    confidence_score = float((ao_confidence + pa_confidence) / 2)
+    needs_review = confidence_score < confidence_threshold
+
+    # ------------------------------------------------------------------
+    # 7. Decide: swap, keep, or flag.
     # ------------------------------------------------------------------
     if ao_correct and pa_correct:
-        # Both vessels are on the anatomically correct side — no action needed.
         return CorrectionResult(
             corrected_labels=labels,
             was_swapped=False,
@@ -263,7 +333,6 @@ def correct_ao_pa_labels(
         )
 
     if not ao_correct and not pa_correct:
-        # Both vessels are on the wrong side — swap the labels.
         labels[ao_mask] = pa_lbl
         labels[pa_mask] = ao_lbl
         return CorrectionResult(
@@ -275,8 +344,7 @@ def correct_ao_pa_labels(
             adjacency_details=adjacency_details,
         )
 
-    # Mixed signal: one vessel looks correct, the other doesn't.
-    # Safer to leave the case untouched and flag for manual review.
+    # Mixed signal — flag for review.
     return CorrectionResult(
         corrected_labels=labels,
         was_swapped=False,
@@ -323,11 +391,18 @@ def correct_ao_pa_fragments(
     describing each reassigned fragment.
     """
     labels = labels.copy()
-    fragment_log: Dict = {"reassigned": [], "skipped_pua": False}
+    fragment_log: Dict = {"reassigned": [], "skipped_disease": False}
 
-    if disease_vec is not None and disease_vec[PUA_FLAG_INDEX] == 1:
-        fragment_log["skipped_pua"] = True
-        return labels, fragment_log
+    # ------------------------------------------------------------------
+    # Check disease-specific skip conditions (HLHS, PuA, …)
+    # ------------------------------------------------------------------
+    if disease_vec is not None:
+        for flag_idx, is_active in enumerate(disease_vec):
+            if is_active and flag_idx in DISEASE_ANATOMY_RULES:
+                rule = DISEASE_ANATOMY_RULES[flag_idx]
+                if rule.get("skip_ao_pa_correction", False):
+                    fragment_log["skipped_disease"] = True
+                    return labels, fragment_log
 
     from scipy.ndimage import label as nd_label
 
@@ -342,10 +417,53 @@ def correct_ao_pa_fragments(
 
     se = _make_ellipsoid_se(dilation_radius_mm, spacing_mm)
 
-    for vessel_lbl, correct_ventricle, wrong_ventricle in [
-        (ao_lbl, lv_mask, rv_mask),   # AO should be near LV
-        (pa_lbl, rv_mask, lv_mask),   # PA should be near RV
+    # ------------------------------------------------------------------
+    # Build disease-resolved vessel→allowed_ventricles map.
+    #   None = unconstrained (skip fragment correction for this vessel).
+    #   set  = ventricle labels this vessel should be near.
+    # ------------------------------------------------------------------
+    # Defaults: AO → {LV}, PA → {RV}
+    ao_allowed: Optional[set] = {lv_lbl}
+    pa_allowed: Optional[set] = {rv_lbl}
+
+    if disease_vec is not None:
+        for flag_idx, is_active in enumerate(disease_vec):
+            if is_active and flag_idx in DISEASE_ANATOMY_RULES:
+                vv = DISEASE_ANATOMY_RULES[flag_idx].get("vessel_ventricle", {})
+                if ao_lbl in vv:
+                    val = vv[ao_lbl]
+                    if val is None:
+                        ao_allowed = None  # unconstrained
+                    elif ao_allowed is not None:
+                        ao_allowed = {val}
+                if pa_lbl in vv:
+                    val = vv[pa_lbl]
+                    if val is None:
+                        pa_allowed = None
+                    elif pa_allowed is not None:
+                        pa_allowed = {val}
+
+    all_ventricles = {lv_lbl, rv_lbl}
+
+    for vessel_lbl, allowed_vents in [
+        (ao_lbl, ao_allowed),
+        (pa_lbl, pa_allowed),
     ]:
+        if allowed_vents is None:
+            continue  # unconstrained — skip this vessel
+
+        wrong_vents = all_ventricles - allowed_vents
+        if not wrong_vents:
+            continue  # no possible "wrong" ventricle
+
+        # Masks for the correct and wrong ventricle side
+        correct_vent_mask = np.zeros(labels.shape, dtype=bool)
+        wrong_vent_mask   = np.zeros(labels.shape, dtype=bool)
+        for v in allowed_vents:
+            correct_vent_mask |= (labels == v)
+        for v in wrong_vents:
+            wrong_vent_mask |= (labels == v)
+
         target_lbl = pa_lbl if vessel_lbl == ao_lbl else ao_lbl
         vessel_mask = labels == vessel_lbl
         if not vessel_mask.any():
@@ -360,8 +478,10 @@ def correct_ao_pa_fragments(
                 comp_mask, se, lv_mask, rv_mask
             )
 
-            correct_score = lv_score if vessel_lbl == ao_lbl else rv_score
-            wrong_score   = rv_score if vessel_lbl == ao_lbl else lv_score
+            # Aggregate scores for correct / wrong ventricle sets
+            score_map = {lv_lbl: lv_score, rv_lbl: rv_score}
+            correct_score = sum(score_map[v] for v in allowed_vents) / len(allowed_vents)
+            wrong_score   = sum(score_map[v] for v in wrong_vents)   / len(wrong_vents)
 
             # No ventricle signal at all — skip (stray fragment, atlas handles it)
             if lv_cnt == 0 and rv_cnt == 0:

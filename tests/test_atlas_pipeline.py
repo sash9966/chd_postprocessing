@@ -487,9 +487,9 @@ class TestRunAtlasPipeline:
         assert "do_anatomy_correction" in src, "do_anatomy_correction parameter must exist"
         assert "create_synthetic_atlas" in src, \
             "create_synthetic_atlas must be called in run_atlas_pipeline (for baseline)"
-        # Verify the mode wiring: baseline → do_perturbation=True, anatomy=False
-        assert 'mode == "baseline"' in src or "mode == 'baseline'" in src, \
-            "mode-based default wiring must reference 'baseline'"
+        # Verify the mode wiring: random_atlas → do_perturbation=True, anatomy=False
+        assert 'mode == "random_atlas"' in src or "mode == 'random_atlas'" in src, \
+            "mode-based default wiring must reference 'random_atlas'"
 
     def test_saved_to_disk(self, tmp_path):
         gt_dir    = self._write_lib(tmp_path)
@@ -523,7 +523,8 @@ class TestRunAtlasPipeline:
         result = run_atlas_pipeline(pred_path=pred_path, gt_folder=gt_dir,
                                     mode="disease_specific",
                                     disease_map_path=dm_path, seed=0)
-        assert result.mode == "disease_specific"
+        # "disease_specific" is a backward-compat alias for "disease_atlas_rules"
+        assert result.mode == "disease_atlas_rules"
         assert result.corrected_labels.shape == SHAPE
 
     def test_empty_gt_folder_raises(self, tmp_path):

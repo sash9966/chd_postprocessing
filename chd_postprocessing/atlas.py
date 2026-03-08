@@ -129,6 +129,7 @@ class AtlasLibrary:
         rng: random.Random,
         mode: str = "best_match",
         exclude_case_id: Optional[str] = None,
+        exclude_case_ids: Optional[List[str]] = None,
     ) -> AtlasEntry:
         """Pick one atlas entry for the given test case.
 
@@ -138,10 +139,13 @@ class AtlasLibrary:
         rng : seeded :class:`random.Random` for reproducibility.
         mode : ``"random"`` — uniform random selection;
                ``"best_match"`` — minimise Hamming distance to *disease_vec*.
-        exclude_case_id : if provided, never select this case (avoids
-                          selecting the test case itself as its own atlas).
-                          The ``_image`` suffix is stripped before comparison
-                          so ``ct_1042`` correctly excludes ``ct_1042_image``.
+        exclude_case_id : single case ID to exclude (backward-compatible).
+                          The ``_image`` suffix is stripped before comparison.
+        exclude_case_ids : list of case IDs to exclude.  Each entry is
+                           normalised by stripping ``_image`` so that both
+                           ``ct_1042`` and ``ct_1042_image`` are excluded when
+                           either form appears in the list.  Merged with
+                           ``exclude_case_id`` if both are provided.
 
         Returns
         -------
@@ -150,10 +154,17 @@ class AtlasLibrary:
         def _base(cid: str) -> str:
             return cid[:-6] if cid.endswith("_image") else cid
 
-        exclude_base = _base(exclude_case_id) if exclude_case_id else None
+        # Build unified set of base IDs to exclude
+        exclude_bases: set = set()
+        if exclude_case_id is not None:
+            exclude_bases.add(_base(exclude_case_id))
+        if exclude_case_ids is not None:
+            for cid in exclude_case_ids:
+                exclude_bases.add(_base(cid))
+
         pool = [
             e for e in self.entries
-            if exclude_base is None or _base(e.case_id) != exclude_base
+            if not exclude_bases or _base(e.case_id) not in exclude_bases
         ]
         if not pool:
             pool = list(self.entries)   # fallback: allow self-match
