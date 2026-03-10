@@ -437,6 +437,7 @@ def correct_labels_with_atlas(
     label_ids:  Optional[List[int]] = None,
     min_overlap: float = 0.10,
     min_component_fraction: float = MIN_COMPONENT_FRACTION,
+    max_reassign_fraction: float = 0.20,
     do_morphological_cleanup: bool = True,
     atlas_masks_override: Optional[Dict[int, np.ndarray]] = None,
 ) -> LabelCorrectionResult:
@@ -457,6 +458,14 @@ def correct_labels_with_atlas(
     min_component_fraction : fraction of the largest component below which a
                              fragment is considered a candidate for reassignment
                              during conflict resolution.
+    max_reassign_fraction : a non-dominant fragment is only eligible for IoC
+                            reassignment when its size is below this fraction of
+                            its label's dominant component.  Fragments larger
+                            than this threshold are almost certainly correct and
+                            should not be moved by an imperfectly registered
+                            atlas.  A second tier (IoC >= 0.5, size < 0.5×
+                            dominant) handles medium-sized fragments with strong
+                            atlas signal.  Default 0.20.
     do_morphological_cleanup : apply closing + hole-filling after assignment.
     atlas_masks_override : if supplied, use these pre-computed per-label boolean
                            masks instead of deriving them from *atlas_reg*.
@@ -525,12 +534,22 @@ def correct_labels_with_atlas(
             # Dominant component — keep original label unconditionally
             assignments.append(orig_j)
         else:
-            # Extra fragment — assign to best atlas match if signal is present
+            # Extra fragment — reassign only if:
+            # 1. IoC signal is strong enough (>= min_overlap), AND
+            # 2. Fragment is small relative to its label's dominant component.
+            # Large fragments are almost certainly correct; reassigning them
+            # via an imperfectly registered atlas causes more harm than good.
             best_j = int(np.argmax(M[i]))
-            if M[i, best_j] >= min_overlap:
+            dominant_size = components[largest_per_label[lbl]]["size"]
+            frag_ratio = comp["size"] / dominant_size if dominant_size > 0 else 1.0
+
+            if M[i, best_j] >= min_overlap and frag_ratio < max_reassign_fraction:
+                assignments.append(best_j)
+            elif M[i, best_j] >= 0.5 and frag_ratio < 0.5:
+                # Medium-sized fragment with strong atlas signal — allow reassignment
                 assignments.append(best_j)
             else:
-                assignments.append(orig_j)  # no atlas signal → keep original
+                assignments.append(orig_j)  # not confident enough → keep original
 
     # ------------------------------------------------------------------
     # Phase 2: anatomical constraint enforcement

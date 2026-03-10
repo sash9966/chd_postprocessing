@@ -425,6 +425,11 @@ def correct_ao_pa_fragments(
     # Defaults: AO → {LV}, PA → {RV}
     ao_allowed: Optional[set] = {lv_lbl}
     pa_allowed: Optional[set] = {rv_lbl}
+    # Track whether a disease rule has already replaced the normal default.
+    # First disease rule REPLACES the default; subsequent ones are UNIONED so
+    # that multiple simultaneous diseases accumulate rather than overwrite.
+    _ao_disease_set_initialized = False
+    _pa_disease_set_initialized = False
 
     if disease_vec is not None:
         for flag_idx, is_active in enumerate(disease_vec):
@@ -435,13 +440,21 @@ def correct_ao_pa_fragments(
                     if val is None:
                         ao_allowed = None  # unconstrained
                     elif ao_allowed is not None:
-                        ao_allowed = {val}
+                        if not _ao_disease_set_initialized:
+                            ao_allowed = {val}           # replace normal default
+                            _ao_disease_set_initialized = True
+                        else:
+                            ao_allowed.add(val)          # union across diseases
                 if pa_lbl in vv:
                     val = vv[pa_lbl]
                     if val is None:
                         pa_allowed = None
                     elif pa_allowed is not None:
-                        pa_allowed = {val}
+                        if not _pa_disease_set_initialized:
+                            pa_allowed = {val}           # replace normal default
+                            _pa_disease_set_initialized = True
+                        else:
+                            pa_allowed.add(val)          # union across diseases
 
     all_ventricles = {lv_lbl, rv_lbl}
 

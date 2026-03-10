@@ -64,10 +64,13 @@ Whole folder::
 """
 from __future__ import annotations
 
+import logging
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
+
+log = logging.getLogger(__name__)
 
 import numpy as np
 import pandas as pd
@@ -123,6 +126,7 @@ class AtlasPipelineResult:
     dice_before:    Optional[Dict[str, float]] = None
     dice_after:     Optional[Dict[str, float]] = None
     adjacency_log:  Optional[List[Dict]]       = None
+    boundary_log:   Optional[List[Dict]]       = None
 
     def dice_delta(self) -> Optional[Dict[str, float]]:
         """Per-class Dice improvement (after − before).  None if GT unavailable."""
@@ -168,12 +172,14 @@ def run_atlas_pipeline(
     gt_path:            Optional[str | Path] = None,
     mode:               str = "random_atlas",
     seed:               int = 42,
-    registration_mode:  str = "centroid",
+    registration_mode:  str = "per_structure",
     min_overlap:        float = 0.10,
     min_component_fraction: float = 0.01,
+    max_reassign_fraction: float = 0.20,
     do_perturbation:    Optional[bool] = None,
     do_anatomy_correction: Optional[bool] = None,
     do_adjacency_correction: Optional[bool] = None,
+    do_boundary_refinement: Optional[bool] = None,
     do_morphological_cleanup: bool = True,
     label_ids:          Optional[List[int]] = None,
 ) -> AtlasPipelineResult:
@@ -206,8 +212,8 @@ def run_atlas_pipeline(
            ================================  ==========  =======  =========
 
     seed : random seed for reproducibility (atlas selection + perturbation).
-    registration_mode : ``"centroid"`` (default), ``"pca"``, or
-                        ``"per_structure"`` (per-label centroid alignment).
+    registration_mode : ``"per_structure"`` (default), ``"centroid"``, or
+                        ``"pca"``.
     min_overlap : minimum IoC for the best atlas match to be accepted when
                   reassigning a non-dominant fragment.  Default 0.10 prevents
                   noise assignments under coarse centroid registration.
@@ -248,6 +254,8 @@ def run_atlas_pipeline(
         do_anatomy_correction = (mode == "disease_atlas_rules")
     if do_adjacency_correction is None:
         do_adjacency_correction = (mode == "disease_atlas_rules")
+    if do_boundary_refinement is None:
+        do_boundary_refinement = True
 
     rng = random.Random(seed)   # seeded once; used for atlas selection then perturbation
 
@@ -313,9 +321,11 @@ def run_atlas_pipeline(
     # ------------------------------------------------------------------
     working_labels = pred_labels.copy()
     if do_anatomy_correction:
-        working_labels, _ = correct_ao_pa_fragments(
+        working_labels, frag_log = correct_ao_pa_fragments(
             working_labels, disease_vec, pred_spacing
         )
+        n_frag = len(frag_log.get("reassigned", []))
+        print(f"  Anatomy priors: {n_frag} fragments reassigned")
 
     # ------------------------------------------------------------------
     # 7. Compute Dice *before* atlas correction (optional)
@@ -354,9 +364,11 @@ def run_atlas_pipeline(
         label_ids=label_ids,
         min_overlap=min_overlap,
         min_component_fraction=min_component_fraction,
+        max_reassign_fraction=max_reassign_fraction,
         do_morphological_cleanup=do_morphological_cleanup,
         atlas_masks_override=atlas_masks_override,
     )
+    print(f"  IoC correction: {'changes made' if correction.was_relabeled else 'no changes'}")
 
     # ------------------------------------------------------------------
     # 9.5 Adjacency-graph correction (disease_atlas_rules mode only)
@@ -372,6 +384,24 @@ def run_atlas_pipeline(
             disease_vec=disease_vec,
             min_component_fraction=min_component_fraction,
         )
+    print(f"  Adjacency correction: {len(adjacency_log or [])} corrections")
+
+    # ------------------------------------------------------------------
+    # 9.7 Per-voxel boundary refinement (all modes)
+    # ------------------------------------------------------------------
+    from .boundary_refinement import refine_all_boundaries
+    boundary_log_list: Optional[List[Dict]] = None
+    if do_boundary_refinement:
+        final_labels, boundary_log_list = refine_all_boundaries(
+            final_labels,
+            atlas_reg=registered_atlas,
+            label_ids=label_ids,
+            disease_vec=disease_vec,
+            width_voxels=3,
+            min_confidence=0.6,
+        )
+        total_br = sum(e.get("a_to_b", 0) + e.get("b_to_a", 0) for e in boundary_log_list)
+        print(f"  Boundary refinement: {total_br} voxels reassigned")
 
     # ------------------------------------------------------------------
     # 10. Compute Dice *after* correction (optional)
@@ -403,6 +433,7 @@ def run_atlas_pipeline(
         dice_before=dice_before,
         dice_after=dice_after,
         adjacency_log=adjacency_log,
+        boundary_log=boundary_log_list,
     )
 
 
