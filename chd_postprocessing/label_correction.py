@@ -440,6 +440,7 @@ def correct_labels_with_atlas(
     max_reassign_fraction: float = 0.20,
     do_morphological_cleanup: bool = True,
     atlas_masks_override: Optional[Dict[int, np.ndarray]] = None,
+    protected_labels: Optional[List[int]] = None,
 ) -> LabelCorrectionResult:
     """Component-level atlas-guided label correction.
 
@@ -467,6 +468,10 @@ def correct_labels_with_atlas(
                             dominant) handles medium-sized fragments with strong
                             atlas signal.  Default 0.20.
     do_morphological_cleanup : apply closing + hole-filling after assignment.
+    protected_labels : label IDs whose components must never be reassigned,
+                       either as source or as target.  Used to protect AO/PA
+                       (labels 6, 7) on PuA/HLHS cases where vessel anatomy
+                       is atypical and atlas-based reassignment is unreliable.
     atlas_masks_override : if supplied, use these pre-computed per-label boolean
                            masks instead of deriving them from *atlas_reg*.
                            Intended for ``registration_mode="per_structure"``
@@ -535,19 +540,31 @@ def correct_labels_with_atlas(
             assignments.append(orig_j)
         else:
             # Extra fragment — reassign only if:
-            # 1. IoC signal is strong enough (>= min_overlap), AND
-            # 2. Fragment is small relative to its label's dominant component.
+            # 1. Source label is not protected (e.g. AO/PA in PuA cases), AND
+            # 2. IoC signal is strong enough (>= min_overlap), AND
+            # 3. Fragment is small relative to its label's dominant component.
             # Large fragments are almost certainly correct; reassigning them
             # via an imperfectly registered atlas causes more harm than good.
+            if protected_labels and lbl in protected_labels:
+                assignments.append(orig_j)  # source label protected — keep original
+                continue
+
             best_j = int(np.argmax(M[i]))
             dominant_size = components[largest_per_label[lbl]]["size"]
             frag_ratio = comp["size"] / dominant_size if dominant_size > 0 else 1.0
 
             if M[i, best_j] >= min_overlap and frag_ratio < max_reassign_fraction:
-                assignments.append(best_j)
+                # Also refuse reassignment TO a protected label
+                if protected_labels and label_ids[best_j] in protected_labels:
+                    assignments.append(orig_j)
+                else:
+                    assignments.append(best_j)
             elif M[i, best_j] >= 0.5 and frag_ratio < 0.5:
                 # Medium-sized fragment with strong atlas signal — allow reassignment
-                assignments.append(best_j)
+                if protected_labels and label_ids[best_j] in protected_labels:
+                    assignments.append(orig_j)
+                else:
+                    assignments.append(best_j)
             else:
                 assignments.append(orig_j)  # not confident enough → keep original
 

@@ -386,6 +386,7 @@ def refine_all_boundaries(
     kernel_size: int = 5,
     min_confidence: float = 0.6,
     max_passes: int = 3,
+    protected_labels: Optional[List[int]] = None,
 ) -> Tuple[np.ndarray, List[Dict]]:
     """Run boundary refinement for all adjacent label pairs.
 
@@ -449,6 +450,9 @@ def refine_all_boundaries(
                     seen.add(key)
 
         for label_a, label_b in pair_list:
+            # Skip pairs where either label is protected (e.g. AO/PA in PuA cases)
+            if protected_labels and (label_a in protected_labels or label_b in protected_labels):
+                continue
             corrected, entry = refine_label_boundary(
                 corrected,
                 label_a=label_a,

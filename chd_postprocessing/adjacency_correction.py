@@ -235,6 +235,7 @@ def correct_by_adjacency(
     disease_vec: Optional[List[int]] = None,
     min_component_fraction: float = 0.05,
     dilation_iters: int = 2,
+    protected_labels: Optional[List[int]] = None,
 ) -> Tuple[np.ndarray, List[Dict]]:
     """Fix label errors detected by adjacency violations.
 
@@ -332,6 +333,10 @@ def correct_by_adjacency(
             comp_label = comp_info["label"]
             comp_size = comp_info["size"]
             largest_size = comp_info["largest_size"]
+
+            # Skip components whose label is protected (e.g. AO/PA in PuA cases)
+            if protected_labels and comp_label in protected_labels:
+                continue
 
             # Re-check: is this component still present and non-dominant?
             # (may have changed in a previous iteration of this pass)
@@ -432,6 +437,10 @@ def correct_by_adjacency(
     dominant_sizes = _find_dominant_components(corrected, label_ids)
 
     for lbl_b in label_ids:
+        # Skip protected labels in chain detection too
+        if protected_labels and lbl_b in protected_labels:
+            continue
+
         mask_b = corrected == lbl_b
         if not mask_b.any():
             continue

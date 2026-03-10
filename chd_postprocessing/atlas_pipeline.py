@@ -175,7 +175,7 @@ def run_atlas_pipeline(
     registration_mode:  str = "per_structure",
     min_overlap:        float = 0.10,
     min_component_fraction: float = 0.01,
-    max_reassign_fraction: float = 0.20,
+    max_reassign_fraction: float = 0.15,
     do_perturbation:    Optional[bool] = None,
     do_anatomy_correction: Optional[bool] = None,
     do_adjacency_correction: Optional[bool] = None,
@@ -289,6 +289,20 @@ def run_atlas_pipeline(
             disease_vec = vec
 
     # ------------------------------------------------------------------
+    # 3.5 Determine protected labels (vessel labels for skip_ao_pa diseases)
+    #     PuA and HLHS have fused/absent vessels — atlas-based reassignment
+    #     of AO/PA is unreliable and causes Dice drops.  Lock those labels.
+    # ------------------------------------------------------------------
+    from .config import DISEASE_ANATOMY_RULES
+    _protected: List[int] = []
+    if disease_vec is not None:
+        for _flag_idx, _is_active in enumerate(disease_vec):
+            if _is_active and _flag_idx in DISEASE_ANATOMY_RULES:
+                if DISEASE_ANATOMY_RULES[_flag_idx].get("skip_ao_pa_correction", False):
+                    _protected.extend([6, 7])  # AO and PA
+    protected_labels: Optional[List[int]] = list(set(_protected)) if _protected else None
+
+    # ------------------------------------------------------------------
     # 4. Select atlas
     # ------------------------------------------------------------------
     selection_mode = "random" if mode == "random_atlas" else "best_match"
@@ -367,6 +381,7 @@ def run_atlas_pipeline(
         max_reassign_fraction=max_reassign_fraction,
         do_morphological_cleanup=do_morphological_cleanup,
         atlas_masks_override=atlas_masks_override,
+        protected_labels=protected_labels,
     )
     print(f"  IoC correction: {'changes made' if correction.was_relabeled else 'no changes'}")
 
@@ -383,6 +398,7 @@ def run_atlas_pipeline(
             label_ids=label_ids,
             disease_vec=disease_vec,
             min_component_fraction=min_component_fraction,
+            protected_labels=protected_labels,
         )
     print(f"  Adjacency correction: {len(adjacency_log or [])} corrections")
 
@@ -399,6 +415,7 @@ def run_atlas_pipeline(
             disease_vec=disease_vec,
             width_voxels=3,
             min_confidence=0.6,
+            protected_labels=protected_labels,
         )
         total_br = sum(e.get("a_to_b", 0) + e.get("b_to_a", 0) for e in boundary_log_list)
         print(f"  Boundary refinement: {total_br} voxels reassigned")
